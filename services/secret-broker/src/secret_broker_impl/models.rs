@@ -1,11 +1,4 @@
-use serde::Deserialize;
 use zeroize::Zeroize;
-
-#[derive(Debug, Deserialize)]
-pub struct UnwrapRequest {
-    pub handle: String,
-    pub redeem_token: String,
-}
 
 /// Response from unwrap - plaintext is base64-encoded.
 /// Implements Drop to zeroize the plaintext string on deallocation.

@@ -144,13 +144,6 @@ impl HardwareSecurityModule {
         Ok(())
     }
 
-    pub async fn shutdown(&self) -> Result<(), anyhow::Error> {
-        *self.status.write().await = HsmStatus::Unhealthy;
-        *self.is_initialized.write().await = false;
-        info!("HardwareSecurityModule shutdown complete");
-        Ok(())
-    }
-
     pub fn get_capabilities(&self) -> Vec<String> {
         vec!["random_generation".to_string(), "key_storage".to_string()]
     }

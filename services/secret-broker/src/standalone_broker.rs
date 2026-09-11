@@ -23,9 +23,12 @@ use tracing::info;
 use uuid::Uuid;
 use x509_parser::{extensions::GeneralName, parse_x509_certificate};
 
-use crate::secret_broker_core::{broker_state_from_env, BrokerClientContext, SecretBrokerState};
+use crate::secret_broker_impl::{
+    broker_state_from_env, discharge_attestation_required_from_env, BrokerClientContext,
+    SecretBrokerState,
+};
 use crate::secret_broker_proto::secret_broker_service_server::SecretBrokerServiceServer;
-use crate::secret_broker_server::SecretBrokerGrpc;
+use crate::secret_broker_server_impl::SecretBrokerGrpc;
 
 const DEFAULT_STANDALONE_BROKER_BIND_ADDR: &str = "127.0.0.1:50052";
 const BROKER_TLS_CERT_ENV: &str = "SECRET_BROKER_TLS_CERT";
@@ -119,6 +122,7 @@ async fn broker_context_from_tls_connection(
     session_id: Uuid,
     principal_requirement: &str,
     attestation_requirement: &str,
+    require_attestation: bool,
 ) -> Result<BrokerClientContext> {
     let mut exporter = [0u8; 32];
     server_conn
@@ -142,10 +146,8 @@ async fn broker_context_from_tls_connection(
     let attestation_digest = attestation_digest_from_peer_cert(cert, pccs_url.as_deref())
         .await
         .with_context(|| attestation_requirement.to_string())?;
-    let attestation_digest = enforce_standalone_peer_attestation_digest(
-        attestation_digest,
-        standalone_broker_require_attestation()?,
-    )?;
+    let attestation_digest =
+        enforce_standalone_peer_attestation_digest(attestation_digest, require_attestation)?;
 
     Ok(BrokerClientContext::from_tls_exporter(
         exporter,
@@ -156,22 +158,39 @@ async fn broker_context_from_tls_connection(
     ))
 }
 
+fn validate_attestation_scope(
+    bind_addr: SocketAddr,
+    require_peer_attestation: bool,
+    require_discharge_attestation: bool,
+) -> Result<()> {
+    if !bind_addr.ip().is_loopback()
+        && (!require_peer_attestation || !require_discharge_attestation)
+    {
+        bail!(
+            "attestation relaxation is permitted only on a loopback bind; non-loopback secret-broker listeners require peer and discharge attestation"
+        );
+    }
+    Ok(())
+}
+
 pub async fn run_from_env() -> Result<()> {
     let bind_addr = env::var("SECRET_BROKER_BIND_ADDR")
         .unwrap_or_else(|_| DEFAULT_STANDALONE_BROKER_BIND_ADDR.to_string())
         .parse::<SocketAddr>()
         .context("invalid SECRET_BROKER_BIND_ADDR")?;
+    let require_peer_attestation = standalone_broker_require_attestation()?;
+    let require_discharge_attestation = discharge_attestation_required_from_env()?;
+    validate_attestation_scope(
+        bind_addr,
+        require_peer_attestation,
+        require_discharge_attestation,
+    )?;
 
-    let broker = broker_state_from_env().await?;
-    let state = Arc::new(SecretBrokerState {
-        broker,
-        // The standalone runtime always expects per-connection ConnectInfo.
-        // This synthetic sentinel is never an authoritative trust source.
-        context: BrokerClientContext::synthetic_dev_context(vec![0u8; 32]),
-    });
-    let grpc = SecretBrokerGrpc::new(state, false);
+    let broker = broker_state_from_env(require_discharge_attestation).await?;
+    let state = Arc::new(SecretBrokerState { broker });
+    let grpc = SecretBrokerGrpc::new(state);
     let tls_config = Arc::new(load_server_tls_config_from_env()?);
-    let incoming = bind_tls_incoming(bind_addr, tls_config).await?;
+    let incoming = bind_tls_incoming(bind_addr, tls_config, require_peer_attestation).await?;
 
     info!(%bind_addr, "standalone secret-broker listening");
 
@@ -300,12 +319,17 @@ fn load_root_store_from_pem(pem: &[u8]) -> Result<RootCertStore> {
 async fn bind_tls_incoming(
     bind_addr: SocketAddr,
     server_config: Arc<ServerConfig>,
+    require_attestation: bool,
 ) -> Result<BrokerTlsIncoming> {
     let listener = TcpListener::bind(bind_addr)
         .await
         .with_context(|| format!("failed to bind standalone broker listener on {bind_addr}"))?;
     let acceptor = TlsAcceptor::from(server_config);
-    Ok(BrokerTlsIncoming::new(listener, acceptor))
+    Ok(BrokerTlsIncoming::new(
+        listener,
+        acceptor,
+        require_attestation,
+    ))
 }
 
 #[pin_project]
@@ -362,6 +386,7 @@ struct BrokerTlsIncoming {
     #[pin]
     incoming: TcpListenerStream,
     acceptor: TlsAcceptor,
+    require_attestation: bool,
     #[pin]
     pending: FuturesUnordered<HandshakeFuture>,
 }
@@ -370,10 +395,11 @@ type HandshakeFuture =
     Pin<Box<dyn futures::Future<Output = Result<BrokerTlsStream, io::Error>> + Send>>;
 
 impl BrokerTlsIncoming {
-    fn new(listener: TcpListener, acceptor: TlsAcceptor) -> Self {
+    fn new(listener: TcpListener, acceptor: TlsAcceptor, require_attestation: bool) -> Self {
         Self {
             incoming: TcpListenerStream::new(listener),
             acceptor,
+            require_attestation,
             pending: FuturesUnordered::new(),
         }
     }
@@ -392,6 +418,7 @@ impl Stream for BrokerTlsIncoming {
         match this.incoming.as_mut().poll_next(cx) {
             Poll::Ready(Some(Ok(stream))) => {
                 let acceptor = this.acceptor.clone();
+                let require_attestation = *this.require_attestation;
                 this.pending.push(Box::pin(async move {
                     let tls_stream = acceptor.accept(stream).await.map_err(io::Error::other)?;
 
@@ -401,6 +428,7 @@ impl Stream for BrokerTlsIncoming {
                         Uuid::new_v4(),
                         "peer certificate must carry a SPIFFE URI SAN",
                         "failed to derive standalone broker peer attestation digest",
+                        require_attestation,
                     )
                     .await
                     .map_err(io::Error::other)?;
@@ -424,7 +452,10 @@ impl Stream for BrokerTlsIncoming {
 
 #[cfg(test)]
 mod tests {
-    use super::{enforce_standalone_peer_attestation_digest, principal_id_from_peer_cert};
+    use super::{
+        enforce_standalone_peer_attestation_digest, principal_id_from_peer_cert,
+        validate_attestation_scope,
+    };
     use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, PKCS_ECDSA_P256_SHA256};
     use rustls::pki_types::CertificateDer;
 
@@ -486,19 +517,33 @@ mod tests {
     }
 
     #[test]
-    fn standalone_attestation_policy_requires_digest_when_pccs_is_configured() {
-        let err = enforce_standalone_peer_attestation_digest(None, true).expect_err(
-            "missing attestation digest must fail when PCCS-backed verification is configured",
-        );
+    fn attestation_relaxation_is_loopback_only() {
+        let loopback = "127.0.0.1:50052".parse().expect("loopback socket");
+        validate_attestation_scope(loopback, false, false)
+            .expect("loopback mTLS may omit attestation for local proof");
+
+        let network = "0.0.0.0:50052".parse().expect("network socket");
+        let err = validate_attestation_scope(network, false, true)
+            .expect_err("non-loopback peer-attestation relaxation must fail");
+        assert!(err.to_string().contains("loopback"));
+        assert!(validate_attestation_scope(network, true, false).is_err());
+        validate_attestation_scope(network, true, true)
+            .expect("non-loopback fully attested mode must be accepted");
+    }
+
+    #[test]
+    fn standalone_attestation_policy_requires_digest_when_configured() {
+        let err = enforce_standalone_peer_attestation_digest(None, true)
+            .expect_err("missing attestation digest must fail when attestation is required");
         assert!(err
             .to_string()
             .contains("missing required RA-TLS attestation evidence"));
     }
 
     #[test]
-    fn standalone_attestation_policy_allows_missing_digest_without_pccs_requirement() {
+    fn standalone_attestation_policy_allows_missing_digest_when_relaxed() {
         let digest = enforce_standalone_peer_attestation_digest(None, false)
-            .expect("missing digest should remain allowed when attestation is not configured");
+            .expect("missing digest should remain allowed in loopback relaxed mode");
         assert!(digest.is_none());
 
         let present = enforce_standalone_peer_attestation_digest(Some(vec![1u8; 32]), true)

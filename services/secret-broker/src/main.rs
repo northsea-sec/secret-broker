@@ -11,5 +11,5 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| "secret_broker=info".into()),
         )
         .init();
-    secret_broker::standalone_broker::run_from_env().await
+    secret_broker::run_from_env().await
 }

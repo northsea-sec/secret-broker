@@ -100,6 +100,7 @@ impl CryptoEngine {
         debug!(
             id = %request.id,
             algorithm = ?request.algorithm,
+            customer_id = %request.customer_id,
             timestamp = %request.timestamp,
             has_exporter = request.exporter_secret.is_some(),
             data_len = request.data.len(),
@@ -157,6 +158,7 @@ impl CryptoEngine {
         debug!(
             id = %request.id,
             algorithm = ?request.algorithm,
+            customer_id = %request.customer_id,
             timestamp = %request.timestamp,
             has_exporter = request.exporter_secret.is_some(),
             ciphertext_len = request.encrypted_data.len(),

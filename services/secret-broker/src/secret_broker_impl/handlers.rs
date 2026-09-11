@@ -14,16 +14,11 @@ use super::sealed_store::{
     SecretEnvelope, SecretLifecycle, StoredEnvelopeRecord, ThirdPartyCaveatKey,
 };
 use super::state::BrokerState;
-use super::transparency::TransparencyEvent;
+use super::transparency::{handle_fingerprint, TransparencyEvent};
 use super::BrokerClientContext;
 
-const HANDLE_PREFIX: &str = "broker:v1:";
-
-/// Every broker handle is strictly single-use: one wrap, one unwrap, then the
-/// redeem token is consumed and the handle becomes inert. The proto wire format
-/// exposes `max_uses` as `uint32` for forward-compatibility, but the runtime
-/// MUST reject any value other than this constant. Allowing >1 unwrap would
-/// break the security model (replayable credential retrieval).
+/// Single-use capabilities permit exactly one successful unwrap. The wire
+/// format carries this as `uint32`, but the V2 runtime rejects every other value.
 pub const BROKER_MAX_USES: u32 = 1;
 const DISCHARGE_TOKEN_TTL_SECONDS: i64 = 5 * 60;
 
@@ -95,20 +90,6 @@ pub enum ServiceError {
     MissingLineage(&'static str),
     #[error("authenticated principal is not authorized for discharge minting")]
     UnauthorizedDischargePrincipal,
-}
-
-fn encode_handle(handle: &Uuid, lifecycle: SecretLifecycle) -> String {
-    let prefix = match lifecycle {
-        SecretLifecycle::SingleUseUnwrap => HANDLE_PREFIX,
-        _ => HANDLE_V2_PREFIX,
-    };
-    format!("{}{}", prefix, handle)
-}
-
-pub fn parse_handle(raw: &str) -> Result<Uuid, ServiceError> {
-    let trimmed = raw.trim();
-    let without_prefix = trimmed.strip_prefix(HANDLE_PREFIX).unwrap_or(trimmed);
-    Uuid::parse_str(without_prefix).map_err(|_| ServiceError::InvalidHandle)
 }
 
 pub(crate) async fn issue_postgres_credentials_impl(
@@ -191,18 +172,15 @@ pub(crate) async fn delete_secret_impl(
     context: &BrokerClientContext,
     handle: &str,
 ) -> Result<bool, ServiceError> {
-    let handle_id = parse_handle_identifier(handle)?;
+    let handle_id = parse_handle_identifier(state, handle)?;
     let store = state.sealed_store();
 
-    // For V2 principal-bound handles, validate caller lineage before deletion.
-    if handle_version(handle) == 2 {
-        if let Some(record) = store
-            .load(&handle_id)
-            .await
-            .map_err(ServiceError::Storage)?
-        {
-            validate_v2_record_management_requirements(&record, context)?;
-        }
+    if let Some(record) = store
+        .load(&handle_id)
+        .await
+        .map_err(ServiceError::Storage)?
+    {
+        validate_v2_record_management_requirements(&record, context)?;
     }
 
     let removed = store
@@ -210,10 +188,11 @@ pub(crate) async fn delete_secret_impl(
         .await
         .map_err(ServiceError::Storage)?;
 
+    let fingerprint = handle_fingerprint(handle);
     if removed {
-        info!(handle, "sealed secret deleted");
+        info!(handle_fingerprint = %fingerprint, "sealed secret deleted");
     } else {
-        info!(handle, "sealed secret already removed");
+        info!(handle_fingerprint = %fingerprint, "sealed secret already removed");
     }
 
     state
@@ -234,17 +213,25 @@ pub(crate) async fn delete_secret_impl(
     Ok(removed)
 }
 
-pub struct PersistedSecretOutcome {
+pub struct WrapSecretOutcome {
     pub handle: String,
     pub expires_at: Option<DateTime<Utc>>,
-    pub envelope_key_id: String,
-    pub exporter_binding_present: bool,
     pub redeem_token: String,
     pub redeem_token_expires_at: Option<DateTime<Utc>>,
 }
 
+struct StoredSecretOutcome {
+    handle_id: Uuid,
+    customer_id: String,
+    expires_at: Option<DateTime<Utc>>,
+    envelope_key_id: String,
+    redeem_token: String,
+    redeem_token_expires_at: Option<DateTime<Utc>>,
+}
+
 struct PersistSecretV2Input<'a> {
     plaintext: &'a [u8],
+    customer_id: String,
     metadata: Option<Value>,
     created_at: DateTime<Utc>,
     expires_at: Option<DateTime<Utc>>,
@@ -257,9 +244,8 @@ async fn persist_secret_v2_with_lifecycle(
     state: &BrokerState,
     context: &BrokerClientContext,
     input: PersistSecretV2Input<'_>,
-) -> Result<PersistedSecretOutcome, ServiceError> {
+) -> Result<StoredSecretOutcome, ServiceError> {
     let handle_id = Uuid::new_v4();
-    let handle = encode_handle(&handle_id, input.lifecycle);
 
     let binding_hash = Sha256::digest(context.exporter());
     let binding_hash_vec = binding_hash.to_vec();
@@ -290,7 +276,7 @@ async fn persist_secret_v2_with_lifecycle(
         .encrypt_pqc(
             input.plaintext,
             &envelope_key_id,
-            state.default_customer_id(),
+            &input.customer_id,
             exporter_binding.as_ref().map(|_| context.exporter()),
         )
         .await
@@ -301,7 +287,7 @@ async fn persist_secret_v2_with_lifecycle(
         algorithm: encryption.algorithm.clone(),
         ciphertext: STANDARD.encode(&encryption.ciphertext),
         kyber_ciphertext: STANDARD.encode(&encryption.nonce),
-        customer_id: state.default_customer_id().to_string(),
+        customer_id: input.customer_id.clone(),
         exporter_binding,
         metadata: input.metadata,
         created_at: input.created_at,
@@ -309,7 +295,7 @@ async fn persist_secret_v2_with_lifecycle(
 
     let key_pair = state
         .crypto()
-        .generate_key_pair("dilithium5", state.default_customer_id())
+        .generate_key_pair("dilithium5", &input.customer_id)
         .await
         .map_err(ServiceError::Crypto)?;
 
@@ -365,11 +351,11 @@ async fn persist_secret_v2_with_lifecycle(
         .await
         .map_err(ServiceError::Storage)?;
 
-    Ok(PersistedSecretOutcome {
-        handle,
+    Ok(StoredSecretOutcome {
+        handle_id,
+        customer_id: input.customer_id,
         expires_at: input.expires_at,
         envelope_key_id,
-        exporter_binding_present: false,
         redeem_token,
         redeem_token_expires_at,
     })
@@ -433,7 +419,7 @@ pub struct MintV2Request {
     pub num_shares: Option<u8>,
     pub lifecycle: SecretLifecycle,
     pub initial_lease_seconds: Option<u64>,
-    /// Phase 6a: custodian identifiers for broker-held shares.
+    /// Custodian identifiers for broker-held threshold shares.
     pub custodian_ids: Vec<String>,
     pub unwrap_principal_id: Option<String>,
 }
@@ -492,25 +478,13 @@ pub fn parse_handle_v2(raw: &str) -> Result<Macaroon, ServiceError> {
     Macaroon::deserialize(b64).map_err(|_| ServiceError::InvalidHandle)
 }
 
-/// Detect handle version from prefix.
-pub fn handle_version(raw: &str) -> u8 {
-    let trimmed = raw.trim();
-    if trimmed.starts_with(HANDLE_V2_PREFIX) {
-        2
-    } else {
-        1
-    }
-}
-
-fn parse_handle_identifier(raw: &str) -> Result<Uuid, ServiceError> {
-    let trimmed = raw.trim();
-    if let Some(v2_suffix) = trimmed.strip_prefix(HANDLE_V2_PREFIX) {
-        if let Ok(uuid) = Uuid::parse_str(v2_suffix) {
-            return Ok(uuid);
-        }
-        return Ok(parse_handle_v2(trimmed)?.identifier);
-    }
-    parse_handle(trimmed)
+fn parse_handle_identifier(state: &BrokerState, raw: &str) -> Result<Uuid, ServiceError> {
+    let macaroon = parse_handle_v2(raw)?;
+    let root_key = state.macaroon_root_key(&macaroon.identifier);
+    macaroon
+        .verify_signature(&root_key)
+        .map_err(|_| ServiceError::InvalidHandle)?;
+    Ok(macaroon.identifier)
 }
 
 fn normalized_context_principal(context: &BrokerClientContext) -> Option<String> {
@@ -546,15 +520,6 @@ fn append_context_transparency_meta(
             Value::String(STANDARD.encode(attestation_digest)),
         );
     }
-}
-
-fn transparency_handle_fingerprint(handle: &str) -> String {
-    let trimmed = handle.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
-    let digest = Sha256::digest(trimmed.as_bytes());
-    format!("sha256:{}", hex::encode(&digest[..8]))
 }
 
 fn secret_lifecycle_label(lifecycle: SecretLifecycle) -> &'static str {
@@ -952,6 +917,7 @@ pub(crate) async fn mint_aead_key_v2_impl(
         context,
         PersistSecretV2Input {
             plaintext: &key_bytes,
+            customer_id: state.default_customer_id().to_string(),
             metadata: Some(Value::Object(metadata)),
             created_at,
             expires_at,
@@ -964,8 +930,8 @@ pub(crate) async fn mint_aead_key_v2_impl(
 
     Zeroize::zeroize(&mut key_bytes);
 
-    // Build macaroon handle
-    let handle_id = parse_handle_identifier(&outcome.handle)?;
+    // Build the only externally valid handle form: a signed V2 macaroon.
+    let handle_id = outcome.handle_id;
     let root_key = state.macaroon_root_key(&handle_id);
     let mut caveats = Vec::new();
     if let Some(ref tid) = request.tenant_id {
@@ -1003,7 +969,6 @@ pub(crate) async fn mint_aead_key_v2_impl(
             .map(|commitment| STANDARD.encode(commitment))
             .collect::<Vec<_>>();
         let store = state.sealed_store();
-        let handle_id = parse_handle_identifier(&outcome.handle)?;
         store
             .update_threshold_config(&handle_id, threshold, encoded_commitments.clone())
             .await
@@ -1061,7 +1026,7 @@ pub(crate) async fn mint_aead_key_v2_impl(
             TransparencyEvent::wrap(
                 &v2_handle,
                 &outcome.envelope_key_id,
-                state.default_customer_id(),
+                &outcome.customer_id,
                 Some(Value::Object(transparency_meta)),
             )
             .with_caller(context.principal_id().unwrap_or("unknown")),
@@ -1081,9 +1046,14 @@ pub(crate) async fn wrap_secret_v2_impl(
     state: &BrokerState,
     context: &BrokerClientContext,
     request: WrapV2Request,
-) -> Result<PersistedSecretOutcome, ServiceError> {
+) -> Result<WrapSecretOutcome, ServiceError> {
     let created_at = Utc::now();
     let lifecycle = request.lifecycle;
+    let customer_id = request
+        .customer_id
+        .clone()
+        .and_then(normalize_optional_string)
+        .unwrap_or_else(|| state.default_customer_id().to_string());
     let (expires_at, effective_ttl) = enforce_ttl(request.ttl_seconds, state, created_at)?;
     let unwrap_principal_id =
         v2_unwrap_principal(context, lifecycle, request.unwrap_principal_id.clone())?;
@@ -1092,6 +1062,7 @@ pub(crate) async fn wrap_secret_v2_impl(
         context,
         PersistSecretV2Input {
             plaintext: &request.plaintext,
+            customer_id,
             metadata: request.metadata.clone(),
             created_at,
             expires_at,
@@ -1102,7 +1073,7 @@ pub(crate) async fn wrap_secret_v2_impl(
     )
     .await?;
 
-    let handle_id = parse_handle_identifier(&outcome.handle)?;
+    let handle_id = outcome.handle_id;
     let root_key = state.macaroon_root_key(&handle_id);
     let mut caveats = Vec::new();
     if let Some(tid) = request.tenant_id.and_then(normalize_optional_string) {
@@ -1134,15 +1105,16 @@ pub(crate) async fn wrap_secret_v2_impl(
     );
     transparency_meta.insert(
         "handle_fingerprint".into(),
-        Value::String(transparency_handle_fingerprint(&v2_handle)),
+        Value::String(handle_fingerprint(&v2_handle)),
     );
     append_context_transparency_meta(&mut transparency_meta, context);
     if let Some(label) = request.label.and_then(normalize_optional_string) {
         transparency_meta.insert("label".into(), Value::String(label));
     }
-    if let Some(customer_id) = request.customer_id.and_then(normalize_optional_string) {
-        transparency_meta.insert("customer_id".into(), Value::String(customer_id));
-    }
+    transparency_meta.insert(
+        "customer_id".into(),
+        Value::String(outcome.customer_id.clone()),
+    );
     if let Some(ttl_seconds) = effective_ttl {
         transparency_meta.insert("ttl_seconds".into(), Value::from(ttl_seconds));
     }
@@ -1157,16 +1129,18 @@ pub(crate) async fn wrap_secret_v2_impl(
             TransparencyEvent::wrap(
                 &v2_handle,
                 &outcome.envelope_key_id,
-                state.default_customer_id(),
+                &outcome.customer_id,
                 Some(Value::Object(transparency_meta)),
             )
             .with_caller(context.principal_id().unwrap_or("unknown")),
         )
         .await;
 
-    Ok(PersistedSecretOutcome {
+    Ok(WrapSecretOutcome {
         handle: v2_handle,
-        ..outcome
+        expires_at: outcome.expires_at,
+        redeem_token: outcome.redeem_token,
+        redeem_token_expires_at: outcome.redeem_token_expires_at,
     })
 }
 
@@ -1372,7 +1346,7 @@ pub(crate) async fn unwrap_secret_v2_impl(
     };
 
     info!(
-        handle = %handle_id,
+        handle_fingerprint = %handle_fingerprint(&payload.handle),
         version = 2,
         lifecycle = event_label,
         "v2 macaroon handle unwrapped"
@@ -1441,6 +1415,9 @@ pub(crate) async fn attenuate_handle_v2_impl(
 ) -> Result<AttenuateV2Response, ServiceError> {
     let mac = parse_handle_v2(&payload.handle)?;
     let handle_id = mac.identifier;
+    let root_key = state.macaroon_root_key(&handle_id);
+    mac.verify_signature(&root_key)
+        .map_err(|_| ServiceError::InvalidHandle)?;
 
     // Validate caller lineage against the stored record for principal-bound handles.
     let store = state.sealed_store();
@@ -1532,7 +1509,7 @@ pub(crate) async fn attenuate_handle_v2_impl(
         .record_transparency(
             TransparencyEvent::attenuate(
                 &payload.handle,
-                state.default_customer_id(),
+                &record.envelope.customer_id,
                 Some(Value::Object({
                     let mut m = serde_json::Map::new();
                     m.insert(
@@ -1572,7 +1549,7 @@ fn normalize_optional_string(value: String) -> Option<String> {
     }
 }
 
-// -- Phase 4: Lifecycle RPCs --------------------------------------------------
+// -- Lifecycle operations ---------------------------------------------------
 
 #[derive(Debug)]
 pub struct RenewLeaseRequest {
@@ -1631,13 +1608,7 @@ pub(crate) async fn renew_lease_impl(
         return Err(ServiceError::InvalidTtl);
     }
 
-    // Determine handle version and extract UUID.
-    let handle_id = if handle_version(&payload.handle) == 2 {
-        let mac = parse_handle_v2(&payload.handle)?;
-        mac.identifier
-    } else {
-        parse_handle(&payload.handle)?
-    };
+    let handle_id = parse_handle_identifier(state, &payload.handle)?;
 
     let store = state.sealed_store();
     let record = store
@@ -1679,7 +1650,7 @@ pub(crate) async fn renew_lease_impl(
         .map_err(ServiceError::Storage)?;
 
     info!(
-        handle = %handle_id,
+        handle_fingerprint = %handle_fingerprint(&payload.handle),
         renewal_count = updated.lease_renewal_count,
         "lease renewed"
     );
@@ -1688,7 +1659,7 @@ pub(crate) async fn renew_lease_impl(
         .record_transparency(
             TransparencyEvent::renew_lease(
                 &payload.handle,
-                state.default_customer_id(),
+                &record.envelope.customer_id,
                 Some(Value::Object({
                     let mut m = serde_json::Map::new();
                     m.insert(
@@ -1719,7 +1690,7 @@ pub(crate) async fn revoke_secret_impl(
     context: &BrokerClientContext,
     payload: RevokeSecretRequest,
 ) -> Result<RevokeSecretResponse, ServiceError> {
-    let handle_id = parse_handle_identifier(&payload.handle)?;
+    let handle_id = parse_handle_identifier(state, &payload.handle)?;
 
     let store = state.sealed_store();
     let record = store
@@ -1728,9 +1699,7 @@ pub(crate) async fn revoke_secret_impl(
         .map_err(ServiceError::Storage)?
         .ok_or(ServiceError::HandleNotFound)?;
 
-    if handle_version(&payload.handle) == 2 {
-        validate_v2_record_management_requirements(&record, context)?;
-    }
+    validate_v2_record_management_requirements(&record, context)?;
 
     let revoked = store
         .revoke(&handle_id, payload.reason.clone())
@@ -1740,21 +1709,21 @@ pub(crate) async fn revoke_secret_impl(
     let revoked_at = if revoked { Some(Utc::now()) } else { None };
 
     if revoked {
-        info!(handle = %handle_id, "secret revoked");
+        info!(
+            handle_fingerprint = %handle_fingerprint(&payload.handle),
+            "secret revoked"
+        );
         state
             .record_transparency(
                 TransparencyEvent::revoke(
                     &payload.handle,
-                    state.default_customer_id(),
+                    &record.envelope.customer_id,
                     Some(Value::Object({
                         let mut m = serde_json::Map::new();
-                        m.insert(
-                            "handle_version".into(),
-                            Value::from(handle_version(&payload.handle)),
-                        );
+                        m.insert("handle_version".into(), Value::from(2));
                         m.insert(
                             "handle_fingerprint".into(),
-                            Value::String(transparency_handle_fingerprint(&payload.handle)),
+                            Value::String(handle_fingerprint(&payload.handle)),
                         );
                         if let Some(ref reason) = payload.reason {
                             m.insert("reason".into(), Value::String(reason.clone()));
@@ -1783,7 +1752,7 @@ pub(crate) async fn rotate_secret_impl(
     context: &BrokerClientContext,
     payload: RotateSecretRequest,
 ) -> Result<RotateSecretResponse, ServiceError> {
-    let old_handle_id = parse_handle_identifier(&payload.old_handle)?;
+    let old_handle_id = parse_handle_identifier(state, &payload.old_handle)?;
     let store = state.sealed_store();
     let old_record = store
         .load(&old_handle_id)
@@ -1791,12 +1760,15 @@ pub(crate) async fn rotate_secret_impl(
         .map_err(ServiceError::Storage)?
         .ok_or(ServiceError::HandleNotFound)?;
 
-    if handle_version(&payload.old_handle) == 2 {
-        validate_v2_record_management_requirements(&old_record, context)?;
-    }
+    validate_v2_record_management_requirements(&old_record, context)?;
 
-    // Step 1: Wrap the new secret with lifecycle + threshold support (Phase 6b).
+    // Wrap the new secret with its lifecycle and threshold policy.
     let created_at = Utc::now();
+    let customer_id = payload
+        .customer_id
+        .clone()
+        .and_then(normalize_optional_string)
+        .unwrap_or_else(|| state.default_customer_id().to_string());
     let (expires_at, _effective_ttl) = enforce_ttl(payload.ttl_seconds, state, created_at)?;
 
     let threshold = payload.threshold.unwrap_or(1).max(1);
@@ -1811,6 +1783,7 @@ pub(crate) async fn rotate_secret_impl(
         context,
         PersistSecretV2Input {
             plaintext: &payload.new_plaintext,
+            customer_id,
             metadata: payload.metadata,
             created_at,
             expires_at,
@@ -1821,10 +1794,22 @@ pub(crate) async fn rotate_secret_impl(
     )
     .await?;
 
-    let new_handle = outcome.handle.clone();
+    let handle_id = outcome.handle_id;
+    let root_key = state.macaroon_root_key(&handle_id);
+    let mut caveats = Vec::new();
+    if let Some(expires_at) = outcome.expires_at {
+        caveats.push(Caveat::Expires(expires_at));
+    }
+    caveats.push(Caveat::Action("unwrap".into()));
+    caveats.push(Caveat::MaxUses);
+    let new_handle = format!(
+        "{}{}",
+        HANDLE_V2_PREFIX,
+        Macaroon::mint(&root_key, handle_id, caveats).serialize()
+    );
     let redeem_token_expires_at = outcome.redeem_token_expires_at;
 
-    // Phase 6b: If threshold > 1, split redeem token into Feldman shares.
+    // If threshold > 1, split redeem material into Feldman shares.
     let (redeem_token, new_shares) = if threshold > 1 {
         let token_bytes = STANDARD
             .decode(outcome.redeem_token.as_bytes())
@@ -1839,7 +1824,6 @@ pub(crate) async fn rotate_secret_impl(
             .iter()
             .map(|commitment| STANDARD.encode(commitment))
             .collect::<Vec<_>>();
-        let handle_id = parse_handle_identifier(&outcome.handle)?;
         store
             .update_threshold_config(&handle_id, threshold, encoded_commitments)
             .await
@@ -1853,7 +1837,7 @@ pub(crate) async fn rotate_secret_impl(
     // against the existing principal/transport lineage above.
     let reason = payload
         .rotation_reason
-        .unwrap_or_else(|| format!("rotated to {}", new_handle));
+        .unwrap_or_else(|| "rotated to replacement capability".to_string());
 
     let old_revoked = store
         .revoke(&old_handle_id, Some(reason.clone()))
@@ -1861,8 +1845,8 @@ pub(crate) async fn rotate_secret_impl(
         .map_err(ServiceError::Storage)?;
 
     info!(
-        old_handle = %old_handle_id,
-        new_handle = new_handle.as_str(),
+        old_handle_fingerprint = %handle_fingerprint(&payload.old_handle),
+        new_handle_fingerprint = %handle_fingerprint(&new_handle),
         old_revoked,
         "secret rotated"
     );
@@ -1874,7 +1858,7 @@ pub(crate) async fn rotate_secret_impl(
                 &payload.old_handle,
                 &new_handle,
                 &outcome.envelope_key_id,
-                state.default_customer_id(),
+                &outcome.customer_id,
                 Some(Value::Object({
                     let mut m = serde_json::Map::new();
                     m.insert("old_revoked".into(), Value::Bool(old_revoked));
@@ -1899,7 +1883,7 @@ pub(crate) async fn rotate_secret_impl(
     })
 }
 
-// -- Phase 5: Third-party discharge minting ------------------------------------
+// -- Third-party discharge minting ------------------------------------------
 
 #[derive(Debug)]
 pub struct MintDischargeRequest {
@@ -1945,6 +1929,9 @@ pub(crate) async fn mint_discharge_impl(
         .map_err(ServiceError::Storage)?
         .ok_or(ServiceError::HandleNotFound)?;
     let root_key = state.macaroon_root_key(&primary_handle_id);
+    primary_mac
+        .verify_signature(&root_key)
+        .map_err(|_| ServiceError::InvalidHandle)?;
     // The predicate is resolved exclusively from sealed per-caveat state.
     let stored_caveat = record
         .third_party_caveat_keys
@@ -2031,9 +2018,9 @@ pub(crate) async fn mint_discharge_impl(
     })
 }
 
-// -- Phase 6a: Custodial share distribution ------------------------------
+// -- Custodial share distribution ------------------------------------------
 
-/// Phase 6a: Claim a broker-held share as an authenticated custodian.
+/// Claim a broker-held share as an authenticated custodian.
 pub(crate) struct ClaimShareRequest {
     pub handle: String,
     pub custodian_id: String,
@@ -2070,23 +2057,21 @@ pub(crate) async fn claim_share_impl(
         ));
     }
 
-    let handle_id =
-        parse_handle_identifier(&req.handle).map_err(|e| anyhow::anyhow!("invalid handle: {e}"))?;
+    let handle_id = parse_handle_identifier(state, &req.handle)
+        .map_err(|e| anyhow::anyhow!("invalid handle: {e}"))?;
 
     // Threshold custody operations must prove authenticated custodian identity and
     // issued-record lineage, but they must not require the final unwrap principal to
     // equal every custodian. Distinct custodians claim shares under their own
     // authenticated identities before one authorized principal performs recovery.
     let store = state.sealed_store();
-    if handle_version(&req.handle) == 2 {
-        if let Some(record) = store
-            .load(&handle_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("load sealed record: {e}"))?
-        {
-            validate_threshold_custody_record_requirements(&record, context)
-                .map_err(|e| anyhow::anyhow!("identity validation: {e}"))?;
-        }
+    if let Some(record) = store
+        .load(&handle_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("load sealed record: {e}"))?
+    {
+        validate_threshold_custody_record_requirements(&record, context)
+            .map_err(|e| anyhow::anyhow!("identity validation: {e}"))?;
     }
 
     let result = store
@@ -2170,22 +2155,20 @@ pub(crate) async fn distribute_share_impl(
         return Err(anyhow::anyhow!("share_index must be 1..=255"));
     }
 
-    let handle_id =
-        parse_handle_identifier(&req.handle).map_err(|e| anyhow::anyhow!("invalid handle: {e}"))?;
+    let handle_id = parse_handle_identifier(state, &req.handle)
+        .map_err(|e| anyhow::anyhow!("invalid handle: {e}"))?;
 
     // Threshold custody operations must validate authenticated custodian identity and
     // issued-record lineage, but they must not force every custodian to equal the
     // final unwrap principal bound to the recovered secret.
-    if handle_version(&req.handle) == 2 {
-        if let Some(record) = state
-            .sealed_store()
-            .load(&handle_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("load sealed record: {e}"))?
-        {
-            validate_threshold_custody_record_requirements(&record, context)
-                .map_err(|e| anyhow::anyhow!("identity validation: {e}"))?;
-        }
+    if let Some(record) = state
+        .sealed_store()
+        .load(&handle_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("load sealed record: {e}"))?
+    {
+        validate_threshold_custody_record_requirements(&record, context)
+            .map_err(|e| anyhow::anyhow!("identity validation: {e}"))?;
     }
 
     // Validate the submitted share matches what the sealed store holds.
@@ -2369,13 +2352,8 @@ pub(crate) async fn combine_shares_impl(
         return Err(anyhow::anyhow!("at least one share is required"));
     }
 
-    let handle_id = if req.handle.starts_with(HANDLE_V2_PREFIX) {
-        parse_handle_v2(&req.handle)
-            .map_err(|e| anyhow::anyhow!("invalid v2 handle: {e}"))?
-            .identifier
-    } else {
-        parse_handle(&req.handle).map_err(|e| anyhow::anyhow!("invalid handle: {e}"))?
-    };
+    let handle_id = parse_handle_identifier(state, &req.handle)
+        .map_err(|e| anyhow::anyhow!("invalid V2 handle: {e}"))?;
 
     let record = state
         .sealed_store()
@@ -2455,14 +2433,15 @@ pub(crate) async fn combine_shares_impl(
 mod tests {
     use super::{
         attenuate_handle_v2_impl, claim_share_impl, delete_secret_impl, distribute_share_impl,
-        issue_postgres_credentials_impl, mint_discharge_impl, parse_handle_identifier,
-        parse_handle_v2, renew_lease_impl, revoke_secret_impl, rotate_secret_impl,
-        transparency_handle_fingerprint, unwrap_secret_v2_impl, v2_unwrap_principal,
+        handle_fingerprint, issue_postgres_credentials_impl, mint_discharge_impl,
+        parse_handle_identifier, parse_handle_v2, renew_lease_impl, revoke_secret_impl,
+        rotate_secret_impl, unwrap_secret_v2_impl, v2_unwrap_principal,
         validate_combine_shares_custody, validate_threshold_custody_record_requirements,
         validate_v2_record_identity_requirements, wrap_secret_v2_impl, AttenuateV2Request,
-        BrokerState, ClaimShareRequest, CombineSharesRequest, DistributeShareRequest,
+        BrokerState, ClaimShareRequest, CombineSharesRequest, DistributeShareRequest, Macaroon,
         MintDischargeRequest, PostgresCredentialParams, RenewLeaseRequest, RevokeSecretRequest,
         RotateSecretRequest, ServiceError, ThirdPartyCaveatRequest, UnwrapV2Request, WrapV2Request,
+        HANDLE_V2_PREFIX,
     };
     use crate::secret_broker_impl::crypto_engine::{CryptoConfig, CryptoEngineService};
     use crate::secret_broker_impl::macaroon_caveats::Caveat;
@@ -2494,7 +2473,7 @@ mod tests {
                 algorithm: "kyber768-hybrid".into(),
                 ciphertext: super::STANDARD.encode(b"cipher-bytes"),
                 kyber_ciphertext: super::STANDARD.encode(b"kem-bytes"),
-                customer_id: "tor-auth".into(),
+                customer_id: "example-customer".into(),
                 exporter_binding: None,
                 metadata: None,
                 created_at: chrono::Utc::now(),
@@ -2554,6 +2533,47 @@ mod tests {
 
     fn encoded_peer_cert(tag: u8) -> String {
         super::STANDARD.encode([tag; 32])
+    }
+
+    fn v2_handle(state: &BrokerState, handle_id: Uuid) -> String {
+        let macaroon = Macaroon::mint(
+            &state.macaroon_root_key(&handle_id),
+            handle_id,
+            vec![Caveat::Action("unwrap".into()), Caveat::MaxUses],
+        );
+        format!("{}{}", HANDLE_V2_PREFIX, macaroon.serialize())
+    }
+
+    #[tokio::test]
+    async fn handle_parser_accepts_only_authentic_serialized_v2_macaroons() {
+        let harness = test_broker_state().await;
+        let handle_id = Uuid::new_v4();
+        let canonical = v2_handle(&harness.state, handle_id);
+        assert_eq!(
+            parse_handle_identifier(&harness.state, &canonical)
+                .expect("parse authentic canonical V2 handle"),
+            handle_id
+        );
+
+        let forged = Macaroon::mint(
+            &[5u8; 32],
+            handle_id,
+            vec![Caveat::Action("unwrap".into()), Caveat::MaxUses],
+        );
+        for invalid in [
+            handle_id.to_string(),
+            format!("broker:v1:{handle_id}"),
+            format!("broker:v2:{handle_id}"),
+            format!("{}{}", HANDLE_V2_PREFIX, forged.serialize()),
+        ] {
+            assert!(
+                matches!(
+                    parse_handle_identifier(&harness.state, &invalid),
+                    Err(ServiceError::InvalidHandle)
+                ),
+                "legacy, unsigned, or forged handle unexpectedly accepted: {invalid}"
+            );
+        }
     }
 
     struct TestBrokerHarness {
@@ -2649,7 +2669,7 @@ mod tests {
         let err = v2_unwrap_principal(
             &synthetic_context(),
             SecretLifecycle::SingleUseUnwrap,
-            Some("spiffe://trust.example/tenant-agent".into()),
+            Some("spiffe://trust.example/workload".into()),
         )
         .expect_err("single-use explicit principal should require authenticated context");
 
@@ -2669,7 +2689,7 @@ mod tests {
         let err = v2_unwrap_principal(
             &context,
             SecretLifecycle::SingleUseUnwrap,
-            Some("spiffe://trust.example/tenant-agent".into()),
+            Some("spiffe://trust.example/workload".into()),
         )
         .expect_err(
             "single-use explicit principal should require authenticated principal identity",
@@ -2685,7 +2705,7 @@ mod tests {
         let context = BrokerClientContext::from_tls_exporter(
             vec![3u8; 32],
             Some(Uuid::new_v4()),
-            Some("spiffe://trust.example/tenant-agent".into()),
+            Some("spiffe://trust.example/workload".into()),
             Some(vec![8u8; 32]),
             None,
         );
@@ -2695,7 +2715,7 @@ mod tests {
 
         assert_eq!(
             principal.as_deref(),
-            Some("spiffe://trust.example/tenant-agent"),
+            Some("spiffe://trust.example/workload"),
         );
     }
 
@@ -2704,7 +2724,7 @@ mod tests {
         let err = v2_unwrap_principal(
             &synthetic_context(),
             SecretLifecycle::RenewableLease,
-            Some("spiffe://trust.example/tenant-agent".into()),
+            Some("spiffe://trust.example/workload".into()),
         )
         .expect_err("renewable lease should require authenticated transport");
 
@@ -2724,13 +2744,13 @@ mod tests {
         let principal = v2_unwrap_principal(
             &context,
             SecretLifecycle::ServiceBootstrap,
-            Some("spiffe://trust.example/tenant-agent".into()),
+            Some("spiffe://trust.example/workload".into()),
         )
         .expect("cross-principal bootstrap binding should be accepted on authenticated transport");
 
         assert_eq!(
             principal.as_deref(),
-            Some("spiffe://trust.example/tenant-agent")
+            Some("spiffe://trust.example/workload")
         );
 
         let default_principal =
@@ -3484,7 +3504,7 @@ mod tests {
         let matching_context = BrokerClientContext::from_tls_exporter(
             vec![3u8; 32],
             Some(Uuid::new_v4()),
-            Some("spiffe://trust.example/tenant-agent".into()),
+            Some("spiffe://trust.example/workload".into()),
             Some(vec![3u8; 32]),
             None,
         );
@@ -3492,7 +3512,7 @@ mod tests {
 
         let missing_issuance_transport = test_record(
             SecretLifecycle::RenewableLease,
-            Some("spiffe://trust.example/tenant-agent"),
+            Some("spiffe://trust.example/workload"),
             false,
             Some("spiffe://trust.example/issuer"),
             Some(issued_peer_cert.as_str()),
@@ -3510,7 +3530,7 @@ mod tests {
 
         let missing_issuer = test_record(
             SecretLifecycle::ServiceBootstrap,
-            Some("spiffe://trust.example/tenant-agent"),
+            Some("spiffe://trust.example/workload"),
             true,
             None,
             Some(issued_peer_cert.as_str()),
@@ -3525,7 +3545,7 @@ mod tests {
 
         let missing_issuer_peer_cert = test_record(
             SecretLifecycle::ServiceBootstrap,
-            Some("spiffe://trust.example/tenant-agent"),
+            Some("spiffe://trust.example/workload"),
             true,
             Some("spiffe://trust.example/issuer"),
             None,
@@ -3542,13 +3562,13 @@ mod tests {
         let no_current_peer_cert = BrokerClientContext::from_tls_exporter(
             vec![4u8; 32],
             Some(Uuid::new_v4()),
-            Some("spiffe://trust.example/tenant-agent".into()),
+            Some("spiffe://trust.example/workload".into()),
             None,
             None,
         );
         let valid_cross_principal = test_record(
             SecretLifecycle::ServiceBootstrap,
-            Some("spiffe://trust.example/tenant-agent"),
+            Some("spiffe://trust.example/workload"),
             true,
             Some("spiffe://trust.example/issuer"),
             Some(issued_peer_cert.as_str()),
@@ -3597,13 +3617,13 @@ mod tests {
         let matching_context = BrokerClientContext::from_tls_exporter(
             vec![5u8; 32],
             Some(Uuid::new_v4()),
-            Some("spiffe://trust.example/tenant-agent".into()),
+            Some("spiffe://trust.example/workload".into()),
             Some(vec![5u8; 32]),
             Some(vec![7u8; 32]),
         );
         let record = test_record(
             SecretLifecycle::ServiceBootstrap,
-            Some("spiffe://trust.example/tenant-agent"),
+            Some("spiffe://trust.example/workload"),
             true,
             Some("spiffe://trust.example/issuer"),
             Some(expected_peer_cert.as_str()),
@@ -3616,7 +3636,7 @@ mod tests {
         let missing_attestation_context = BrokerClientContext::from_tls_exporter(
             vec![5u8; 32],
             Some(Uuid::new_v4()),
-            Some("spiffe://trust.example/tenant-agent".into()),
+            Some("spiffe://trust.example/workload".into()),
             Some(vec![5u8; 32]),
             None,
         );
@@ -3632,7 +3652,7 @@ mod tests {
         let mismatched_context = BrokerClientContext::from_tls_exporter(
             vec![5u8; 32],
             Some(Uuid::new_v4()),
-            Some("spiffe://trust.example/tenant-agent".into()),
+            Some("spiffe://trust.example/workload".into()),
             Some(vec![5u8; 32]),
             Some(vec![8u8; 32]),
         );
@@ -3803,7 +3823,8 @@ mod tests {
             "unexpected remaining ttl: {remaining}"
         );
 
-        let handle_id = parse_handle_identifier(&wrapped.handle).expect("parse wrapped handle");
+        let handle_id = parse_handle_identifier(&harness.state, &wrapped.handle)
+            .expect("parse authenticated wrapped handle");
         let record = harness
             .state
             .sealed_store()
@@ -3902,7 +3923,7 @@ mod tests {
         let issuing_context = BrokerClientContext::from_tls_exporter(
             vec![9u8; 32],
             Some(Uuid::new_v4()),
-            Some("spiffe://trust.example/tenant-agent-a".into()),
+            Some("spiffe://trust.example/workload-a".into()),
             Some(vec![9u8; 32]),
             None,
         );
@@ -3946,7 +3967,7 @@ mod tests {
         let wrong_principal_context = BrokerClientContext::from_tls_exporter(
             vec![10u8; 32],
             Some(Uuid::new_v4()),
-            Some("spiffe://trust.example/tenant-agent-b".into()),
+            Some("spiffe://trust.example/workload-b".into()),
             Some(vec![10u8; 32]),
             None,
         );
@@ -4019,7 +4040,7 @@ mod tests {
             &harness.state,
             &wrong_context,
             ClaimShareRequest {
-                handle: format!("broker:v2:{}", handle_id),
+                handle: v2_handle(&harness.state, handle_id),
                 custodian_id: "spiffe://trust.example/cust-a".into(),
             },
         )
@@ -4070,7 +4091,7 @@ mod tests {
             &harness.state,
             &context,
             ClaimShareRequest {
-                handle: format!("broker:v2:{}", handle_id),
+                handle: v2_handle(&harness.state, handle_id),
                 custodian_id: "spiffe://trust.example/cust-a".into(),
             },
         )
@@ -4105,7 +4126,7 @@ mod tests {
             &harness.state,
             &owner_context,
             DistributeShareRequest {
-                handle: format!("broker:v2:{}", handle_id),
+                handle: v2_handle(&harness.state, handle_id),
                 share_index: 1,
                 share: crate::secret_broker_impl::threshold::Share {
                     x: 1,
@@ -4152,7 +4173,7 @@ mod tests {
             &harness.state,
             &context,
             DistributeShareRequest {
-                handle: format!("broker:v2:{}", handle_id),
+                handle: v2_handle(&harness.state, handle_id),
                 share_index: 1,
                 share: crate::secret_broker_impl::threshold::Share {
                     x: 1,
@@ -4233,7 +4254,7 @@ mod tests {
         let issuing_context = BrokerClientContext::from_tls_exporter(
             vec![13u8; 32],
             Some(Uuid::new_v4()),
-            Some("spiffe://trust.example/tenant-agent-a".into()),
+            Some("spiffe://trust.example/workload-a".into()),
             Some(vec![13u8; 32]),
             None,
         );
@@ -4277,7 +4298,7 @@ mod tests {
         let wrong_principal_context = BrokerClientContext::from_tls_exporter(
             vec![14u8; 32],
             Some(Uuid::new_v4()),
-            Some("spiffe://trust.example/tenant-agent-b".into()),
+            Some("spiffe://trust.example/workload-b".into()),
             Some(vec![14u8; 32]),
             None,
         );
@@ -4396,19 +4417,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hidden_grant_revoke_persists_lineage_in_transparency_log() {
+    async fn revoke_persists_generic_lineage_metadata_in_transparency_log() {
         let harness = test_broker_state_with_transparency().await;
         let transparency_path = harness
             .transparency_path
             .clone()
             .expect("transparency path");
-        let issuing_context = authenticated_context("spiffe://trust.example/entry-runtime-a", 21);
-        let hidden_grant_metadata = json!({
-            "hidden_handoff_lineage": {
-                "grant_kind": "entry-to-operational",
+        let issuing_context = authenticated_context("spiffe://trust.example/workload-a", 21);
+        let key_lineage_metadata = json!({
+            "key_lineage": {
+                "purpose": "service-bootstrap",
                 "credential_id": Uuid::new_v4().to_string(),
-                "source_onion_fingerprint": "sha256:entry1234",
-                "target_onion_fingerprint": "sha256:target5678",
+                "source_key_fingerprint": "sha256:source1234",
+                "target_key_fingerprint": "sha256:target5678",
                 "generation": 4,
             }
         });
@@ -4417,36 +4438,40 @@ mod tests {
             &harness.state,
             &issuing_context,
             WrapV2Request {
-                plaintext: b"hidden-grant".to_vec(),
-                customer_id: None,
-                metadata: Some(hidden_grant_metadata.clone()),
+                plaintext: b"bootstrap-key".to_vec(),
+                customer_id: Some("customer-a".into()),
+                metadata: Some(key_lineage_metadata.clone()),
                 lifecycle: SecretLifecycle::SingleUseUnwrap,
                 ttl_seconds: Some(300),
                 initial_lease_seconds: None,
-                label: Some("entry-operational-hidden-grant".into()),
+                label: Some("bootstrap-key".into()),
                 tenant_id: Some("tenant-a".into()),
                 provider: None,
                 circuit_id: None,
-                node_id: Some("target-node".into()),
+                node_id: Some("workload-b".into()),
                 unwrap_principal_id: None,
             },
         )
         .await
-        .expect("wrap hidden grant with lineage metadata");
+        .expect("wrap key with lineage metadata");
 
         let revoked = revoke_secret_impl(
             &harness.state,
             &issuing_context,
             RevokeSecretRequest {
                 handle: wrapped.handle.clone(),
-                reason: Some("ids_operational_burn_hidden_grants".into()),
+                reason: Some("superseded".into()),
             },
         )
         .await
-        .expect("revoke hidden grant");
+        .expect("revoke key");
         assert!(revoked.revoked);
 
         let contents = fs::read_to_string(&transparency_path).expect("read transparency log");
+        assert!(
+            !contents.contains(&wrapped.handle),
+            "transparency log must not contain the raw V2 capability"
+        );
         let lines: Vec<_> = contents.lines().collect();
         assert_eq!(
             lines.len(),
@@ -4456,23 +4481,22 @@ mod tests {
 
         let wrap_event: Value = serde_json::from_str(lines[0]).expect("parse wrap event");
         let revoke_event: Value = serde_json::from_str(lines[1]).expect("parse revoke event");
-        let expected_fingerprint = transparency_handle_fingerprint(&wrapped.handle);
+        let expected_fingerprint = handle_fingerprint(&wrapped.handle);
 
         assert_eq!(wrap_event["event"], json!("wrap"));
+        assert_eq!(wrap_event["customer_id"], json!("customer-a"));
         assert_eq!(
             wrap_event["metadata"]["handle_fingerprint"],
             json!(expected_fingerprint)
         );
         assert_eq!(
             wrap_event["metadata"]["secret_metadata"],
-            hidden_grant_metadata.clone()
+            key_lineage_metadata.clone()
         );
 
         assert_eq!(revoke_event["event"], json!("revoke"));
-        assert_eq!(
-            revoke_event["metadata"]["reason"],
-            json!("ids_operational_burn_hidden_grants")
-        );
+        assert_eq!(revoke_event["customer_id"], json!("customer-a"));
+        assert_eq!(revoke_event["metadata"]["reason"], json!("superseded"));
         assert_eq!(
             revoke_event["metadata"]["handle_fingerprint"],
             json!(expected_fingerprint)
@@ -4487,15 +4511,15 @@ mod tests {
         );
         assert_eq!(
             revoke_event["metadata"]["issued_by_principal_id"],
-            json!("spiffe://trust.example/entry-runtime-a")
+            json!("spiffe://trust.example/workload-a")
         );
         assert_eq!(
             revoke_event["metadata"]["unwrap_principal_id"],
-            json!("spiffe://trust.example/entry-runtime-a")
+            json!("spiffe://trust.example/workload-a")
         );
         assert_eq!(
             revoke_event["metadata"]["secret_metadata"],
-            hidden_grant_metadata
+            key_lineage_metadata
         );
     }
 
@@ -4570,7 +4594,7 @@ mod tests {
             Some(vec![30u8; 32]),
             None,
         );
-        let target_principal = "spiffe://trust.example/tenant-agent-x";
+        let target_principal = "spiffe://trust.example/workload-x";
 
         // Wrap with ServiceBootstrap, binding unwrap to a different principal.
         let wrapped = wrap_secret_v2_impl(
@@ -4686,7 +4710,7 @@ mod tests {
             Some(vec![30u8; 32]),
             None,
         );
-        let target_principal = "spiffe://trust.example/tenant-agent-x";
+        let target_principal = "spiffe://trust.example/workload-x";
 
         let wrapped_for_revoke = wrap_secret_v2_impl(
             &harness.state,

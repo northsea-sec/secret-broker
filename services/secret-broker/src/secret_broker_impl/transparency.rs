@@ -24,7 +24,15 @@ pub struct TransparencyLogger {
 
 const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
+pub(crate) fn handle_fingerprint(handle: &str) -> String {
+    format!(
+        "sha256:{}",
+        hex::encode(Sha256::digest(handle.trim().as_bytes()))
+    )
+}
+
 /// Result of a transparency log chain verification.
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct VerifyResult {
     /// Number of entries verified.
@@ -105,6 +113,7 @@ impl TransparencyLogger {
     /// Returns `Ok(VerifyResult)` with the number of entries checked and the
     /// final entry hash. Returns an error if any link is broken (i.e. the
     /// SHA-256 of line N does not match line N+1's `prev_hash` field).
+    #[cfg(test)]
     pub fn verify_chain(path: impl AsRef<Path>) -> Result<VerifyResult> {
         let file = fs::File::open(path.as_ref())
             .with_context(|| format!("opening transparency log at {}", path.as_ref().display()))?;
@@ -192,41 +201,41 @@ pub struct TransparencyEvent {
     pub sequence: u64,
     pub prev_hash: String,
     pub event: &'static str,
-    pub handle: Option<String>,
+    pub handle_fingerprint: Option<String>,
     pub envelope_key_id: Option<String>,
     pub customer_id: Option<String>,
     pub status: &'static str,
     pub timestamp: DateTime<Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Value>,
-    /// Phase 8: Authenticated caller identity (SPIFFE ID, admin key fingerprint, or session label).
+    /// Authenticated caller identity (SPIFFE ID, admin key fingerprint, or session label).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub caller_identity: Option<String>,
-    /// Phase 8: Parent handle for attenuation lineage tracking.
+    /// Fingerprint of the parent handle for attenuation lineage tracking.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub parent_handle: Option<String>,
-    /// Phase 8: Lease sequence number for renewal audit trail.
+    pub parent_handle_fingerprint: Option<String>,
+    /// Lease sequence number for renewal audit trail.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lease_sequence: Option<u32>,
-    /// Phase 8: Previous lease expiry for renewal audit trail.
+    /// Previous lease expiry for renewal audit trail.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub previous_expires_at: Option<DateTime<Utc>>,
 }
 
 impl TransparencyEvent {
-    /// Set caller identity for governance audit (Phase 8).
+    /// Set caller identity for governance audit.
     pub fn with_caller(mut self, caller: impl Into<String>) -> Self {
         self.caller_identity = Some(caller.into());
         self
     }
 
-    /// Set parent handle for attenuation lineage (Phase 8).
-    pub fn with_parent_handle(mut self, parent: impl Into<String>) -> Self {
-        self.parent_handle = Some(parent.into());
+    /// Record a fingerprint of the parent handle for attenuation lineage.
+    pub fn with_parent_handle(mut self, parent: impl AsRef<str>) -> Self {
+        self.parent_handle_fingerprint = Some(handle_fingerprint(parent.as_ref()));
         self
     }
 
-    /// Set lease renewal metadata (Phase 8).
+    /// Set lease renewal metadata.
     pub fn with_lease_renewal(mut self, sequence: u32, previous_expires: DateTime<Utc>) -> Self {
         self.lease_sequence = Some(sequence);
         self.previous_expires_at = Some(previous_expires);
@@ -238,14 +247,14 @@ impl TransparencyEvent {
             sequence: 0,
             prev_hash: String::new(),
             event: "wrap",
-            handle: None,
+            handle_fingerprint: None,
             envelope_key_id: None,
             customer_id: None,
             status: "issued",
             timestamp: Utc::now(),
             metadata: None,
             caller_identity: None,
-            parent_handle: None,
+            parent_handle_fingerprint: None,
             lease_sequence: None,
             previous_expires_at: None,
         }
@@ -254,7 +263,7 @@ impl TransparencyEvent {
     pub fn wrap(handle: &str, envelope: &str, customer_id: &str, metadata: Option<Value>) -> Self {
         Self {
             event: "wrap",
-            handle: Some(handle.to_string()),
+            handle_fingerprint: Some(handle_fingerprint(handle)),
             envelope_key_id: Some(envelope.to_string()),
             customer_id: Some(customer_id.to_string()),
             status: "issued",
@@ -271,7 +280,7 @@ impl TransparencyEvent {
     ) -> Self {
         Self {
             event: "unwrap",
-            handle: Some(handle.to_string()),
+            handle_fingerprint: Some(handle_fingerprint(handle)),
             envelope_key_id: envelope.map(|value| value.to_string()),
             customer_id: Some(customer_id.to_string()),
             status: "unwrapped",
@@ -280,27 +289,10 @@ impl TransparencyEvent {
         }
     }
 
-    pub fn mint_aead(
-        handle: &str,
-        envelope: &str,
-        customer_id: &str,
-        metadata: Option<Value>,
-    ) -> Self {
-        Self {
-            event: "mint_aead",
-            handle: Some(handle.to_string()),
-            envelope_key_id: Some(envelope.to_string()),
-            customer_id: Some(customer_id.to_string()),
-            status: "issued",
-            metadata,
-            ..Self::base()
-        }
-    }
-
     pub fn delete(handle: &str, found: bool, metadata: Option<Value>) -> Self {
         Self {
             event: "delete",
-            handle: Some(handle.to_string()),
+            handle_fingerprint: Some(handle_fingerprint(handle)),
             status: if found { "removed" } else { "not_found" },
             metadata,
             ..Self::base()
@@ -310,7 +302,7 @@ impl TransparencyEvent {
     pub fn revoke(handle: &str, customer_id: &str, metadata: Option<Value>) -> Self {
         Self {
             event: "revoke",
-            handle: Some(handle.to_string()),
+            handle_fingerprint: Some(handle_fingerprint(handle)),
             customer_id: Some(customer_id.to_string()),
             status: "revoked",
             metadata,
@@ -321,7 +313,7 @@ impl TransparencyEvent {
     pub fn renew_lease(handle: &str, customer_id: &str, metadata: Option<Value>) -> Self {
         Self {
             event: "renew_lease",
-            handle: Some(handle.to_string()),
+            handle_fingerprint: Some(handle_fingerprint(handle)),
             customer_id: Some(customer_id.to_string()),
             status: "renewed",
             metadata,
@@ -332,7 +324,7 @@ impl TransparencyEvent {
     pub fn attenuate(handle: &str, customer_id: &str, metadata: Option<Value>) -> Self {
         Self {
             event: "attenuate",
-            handle: Some(handle.to_string()),
+            handle_fingerprint: Some(handle_fingerprint(handle)),
             customer_id: Some(customer_id.to_string()),
             status: "attenuated",
             metadata,
@@ -353,11 +345,17 @@ impl TransparencyEvent {
                 _ => None,
             })
             .unwrap_or_default();
-        meta.insert("old_handle".into(), Value::String(old_handle.to_string()));
-        meta.insert("new_handle".into(), Value::String(new_handle.to_string()));
+        meta.insert(
+            "old_handle_fingerprint".into(),
+            Value::String(handle_fingerprint(old_handle)),
+        );
+        meta.insert(
+            "new_handle_fingerprint".into(),
+            Value::String(handle_fingerprint(new_handle)),
+        );
         Self {
             event: "rotate",
-            handle: Some(new_handle.to_string()),
+            handle_fingerprint: Some(handle_fingerprint(new_handle)),
             envelope_key_id: Some(envelope_key_id.to_string()),
             customer_id: Some(customer_id.to_string()),
             status: "rotated",
@@ -379,14 +377,14 @@ mod tests {
         pub sequence: u64,
         pub prev_hash: String,
         pub event: String,
-        pub handle: Option<String>,
+        pub handle_fingerprint: Option<String>,
         pub envelope_key_id: Option<String>,
         pub customer_id: Option<String>,
         pub status: String,
         pub timestamp: DateTime<Utc>,
         pub metadata: Option<Value>,
         pub caller_identity: Option<String>,
-        pub parent_handle: Option<String>,
+        pub parent_handle_fingerprint: Option<String>,
         pub lease_sequence: Option<u32>,
         pub previous_expires_at: Option<DateTime<Utc>>,
     }
@@ -412,6 +410,10 @@ mod tests {
             .expect("record second entry");
 
         let contents = fs::read_to_string(&path).expect("read log");
+        assert!(
+            !contents.contains("handle-1"),
+            "transparency log must not contain raw capability handles"
+        );
         let lines: Vec<_> = contents.lines().collect();
         assert_eq!(lines.len(), 2);
 
@@ -420,7 +422,10 @@ mod tests {
         assert_eq!(first.status, "issued");
         assert_eq!(first.sequence, 0);
         assert_eq!(first.prev_hash, GENESIS_HASH);
-        assert_eq!(first.handle.as_deref(), Some("handle-1"));
+        assert_eq!(
+            first.handle_fingerprint,
+            Some(handle_fingerprint("handle-1"))
+        );
         assert_eq!(first.envelope_key_id.as_deref(), Some("envelope-1"));
         assert_eq!(first.customer_id.as_deref(), Some("cust-a"));
         assert!(
@@ -436,7 +441,10 @@ mod tests {
         // second.prev_hash should be SHA-256 of the first line
         let expected_hash = hex::encode(Sha256::digest(lines[0].as_bytes()));
         assert_eq!(second.prev_hash, expected_hash);
-        assert_eq!(second.handle.as_deref(), Some("handle-1"));
+        assert_eq!(
+            second.handle_fingerprint,
+            Some(handle_fingerprint("handle-1"))
+        );
         assert_eq!(second.envelope_key_id, None);
         assert_eq!(second.customer_id, None);
         assert!(
@@ -518,13 +526,19 @@ mod tests {
         let attenuation: TransparencyEventOwned =
             serde_json::from_str(lines[0]).expect("parse attenuation entry");
         assert_eq!(attenuation.event, "attenuate");
-        assert_eq!(attenuation.handle.as_deref(), Some("child-handle"));
+        assert_eq!(
+            attenuation.handle_fingerprint,
+            Some(handle_fingerprint("child-handle"))
+        );
         assert_eq!(attenuation.customer_id.as_deref(), Some("cust-a"));
         assert_eq!(
             attenuation.caller_identity.as_deref(),
             Some("spiffe://cluster/ns/default/sa/attenuator")
         );
-        assert_eq!(attenuation.parent_handle.as_deref(), Some("parent-handle"));
+        assert_eq!(
+            attenuation.parent_handle_fingerprint,
+            Some(handle_fingerprint("parent-handle"))
+        );
         assert_eq!(attenuation.metadata, Some(json!({"scope": "read"})));
         assert_eq!(attenuation.lease_sequence, None);
         assert_eq!(attenuation.previous_expires_at, None);
@@ -533,13 +547,19 @@ mod tests {
             serde_json::from_str(lines[1]).expect("parse renewal entry");
         assert_eq!(renewal.event, "renew_lease");
         assert_eq!(renewal.status, "renewed");
-        assert_eq!(renewal.handle.as_deref(), Some("child-handle"));
+        assert_eq!(
+            renewal.handle_fingerprint,
+            Some(handle_fingerprint("child-handle"))
+        );
         assert_eq!(renewal.customer_id.as_deref(), Some("cust-a"));
         assert_eq!(
             renewal.caller_identity.as_deref(),
             Some("spiffe://cluster/ns/default/sa/renewer")
         );
-        assert_eq!(renewal.parent_handle.as_deref(), Some("parent-handle"));
+        assert_eq!(
+            renewal.parent_handle_fingerprint,
+            Some(handle_fingerprint("parent-handle"))
+        );
         assert_eq!(renewal.lease_sequence, Some(7));
         assert_eq!(renewal.previous_expires_at, Some(previous_expires_at));
         assert_eq!(
@@ -559,7 +579,7 @@ mod tests {
     }
 
     #[test]
-    fn rotate_injects_handle_metadata_and_preserves_lineage_fields() {
+    fn rotate_injects_redacted_handle_metadata_and_preserves_lineage() {
         let event = TransparencyEvent::rotate(
             "old-handle",
             "new-handle",
@@ -572,20 +592,26 @@ mod tests {
 
         assert_eq!(event.event, "rotate");
         assert_eq!(event.status, "rotated");
-        assert_eq!(event.handle.as_deref(), Some("new-handle"));
+        assert_eq!(
+            event.handle_fingerprint,
+            Some(handle_fingerprint("new-handle"))
+        );
         assert_eq!(event.envelope_key_id.as_deref(), Some("envelope-1"));
         assert_eq!(event.customer_id.as_deref(), Some("cust-a"));
         assert_eq!(
             event.caller_identity.as_deref(),
             Some("spiffe://cluster/ns/default/sa/rotator")
         );
-        assert_eq!(event.parent_handle.as_deref(), Some("parent-handle"));
+        assert_eq!(
+            event.parent_handle_fingerprint,
+            Some(handle_fingerprint("parent-handle"))
+        );
         assert_eq!(
             event.metadata,
             Some(json!({
                 "reason": "scheduled_rotation",
-                "old_handle": "old-handle",
-                "new_handle": "new-handle"
+                "old_handle_fingerprint": handle_fingerprint("old-handle"),
+                "new_handle_fingerprint": handle_fingerprint("new-handle")
             }))
         );
     }
@@ -595,28 +621,34 @@ mod tests {
         let event = TransparencyEvent::revoke(
             "new-handle",
             "cust-a",
-            Some(json!({"reason": "operator_burn", "source": "ids"})),
+            Some(json!({"reason": "manual_revocation", "source": "operator"})),
         )
         .with_caller("spiffe://cluster/ns/default/sa/revoker")
         .with_parent_handle("old-handle");
 
         assert_eq!(event.event, "revoke");
         assert_eq!(event.status, "revoked");
-        assert_eq!(event.handle.as_deref(), Some("new-handle"));
+        assert_eq!(
+            event.handle_fingerprint,
+            Some(handle_fingerprint("new-handle"))
+        );
         assert_eq!(event.customer_id.as_deref(), Some("cust-a"));
         assert_eq!(
             event.caller_identity.as_deref(),
             Some("spiffe://cluster/ns/default/sa/revoker")
         );
-        assert_eq!(event.parent_handle.as_deref(), Some("old-handle"));
+        assert_eq!(
+            event.parent_handle_fingerprint,
+            Some(handle_fingerprint("old-handle"))
+        );
         assert_eq!(
             event.metadata,
-            Some(json!({"reason": "operator_burn", "source": "ids"}))
+            Some(json!({"reason": "manual_revocation", "source": "operator"}))
         );
     }
 
     #[test]
-    fn rotate_discards_non_object_metadata_and_keeps_handle_fields() {
+    fn rotate_discards_non_object_metadata_and_keeps_fingerprints() {
         let event = TransparencyEvent::rotate(
             "old-handle",
             "new-handle",
@@ -629,8 +661,8 @@ mod tests {
         assert_eq!(
             event.metadata,
             Some(json!({
-                "old_handle": "old-handle",
-                "new_handle": "new-handle"
+                "old_handle_fingerprint": handle_fingerprint("old-handle"),
+                "new_handle_fingerprint": handle_fingerprint("new-handle")
             }))
         );
     }
@@ -686,26 +718,35 @@ mod tests {
         let wrap: TransparencyEventOwned = serde_json::from_str(lines[0]).expect("parse wrap");
         assert_eq!(wrap.event, "wrap");
         assert_eq!(wrap.status, "issued");
-        assert_eq!(wrap.handle.as_deref(), Some("old-handle"));
+        assert_eq!(
+            wrap.handle_fingerprint,
+            Some(handle_fingerprint("old-handle"))
+        );
         assert_eq!(wrap.metadata, Some(json!({"ttl": 60})));
 
         let rotate: TransparencyEventOwned = serde_json::from_str(lines[1]).expect("parse rotate");
         assert_eq!(rotate.event, "rotate");
         assert_eq!(rotate.status, "rotated");
-        assert_eq!(rotate.handle.as_deref(), Some("new-handle"));
+        assert_eq!(
+            rotate.handle_fingerprint,
+            Some(handle_fingerprint("new-handle"))
+        );
         assert_eq!(rotate.envelope_key_id.as_deref(), Some("envelope-2"));
         assert_eq!(rotate.customer_id.as_deref(), Some("cust-a"));
         assert_eq!(
             rotate.caller_identity.as_deref(),
             Some("spiffe://cluster/ns/default/sa/rotator")
         );
-        assert_eq!(rotate.parent_handle.as_deref(), Some("old-handle"));
+        assert_eq!(
+            rotate.parent_handle_fingerprint,
+            Some(handle_fingerprint("old-handle"))
+        );
         assert_eq!(
             rotate.metadata,
             Some(json!({
                 "reason": "scheduled_rotation",
-                "old_handle": "old-handle",
-                "new_handle": "new-handle"
+                "old_handle_fingerprint": handle_fingerprint("old-handle"),
+                "new_handle_fingerprint": handle_fingerprint("new-handle")
             }))
         );
         assert_eq!(
@@ -716,13 +757,19 @@ mod tests {
         let revoke: TransparencyEventOwned = serde_json::from_str(lines[2]).expect("parse revoke");
         assert_eq!(revoke.event, "revoke");
         assert_eq!(revoke.status, "revoked");
-        assert_eq!(revoke.handle.as_deref(), Some("new-handle"));
+        assert_eq!(
+            revoke.handle_fingerprint,
+            Some(handle_fingerprint("new-handle"))
+        );
         assert_eq!(revoke.customer_id.as_deref(), Some("cust-a"));
         assert_eq!(
             revoke.caller_identity.as_deref(),
             Some("spiffe://cluster/ns/default/sa/revoker")
         );
-        assert_eq!(revoke.parent_handle.as_deref(), Some("old-handle"));
+        assert_eq!(
+            revoke.parent_handle_fingerprint,
+            Some(handle_fingerprint("old-handle"))
+        );
         assert_eq!(
             revoke.metadata,
             Some(json!({"reason": "operator_burn", "source": "ids"}))

@@ -1,16 +1,13 @@
 //! RA-TLS certificate evidence helpers used by the standalone broker boundary.
 
-use std::io::Cursor;
-
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use rustls::pki_types::CertificateDer;
-use rustls_pemfile::certs;
 use sha2::{Digest, Sha256};
 use x509_parser::parse_x509_certificate;
 
 use crate::ra_tls::attestation::Attestation;
 use crate::ra_tls::qvl::quote::Report;
-use crate::service_auth::ratls::reject_unsupported_verified_ratls_vendor;
+use crate::ra_tls::vendor::TEEVendor;
 
 pub async fn attestation_digest_from_cert(
     cert: &CertificateDer<'_>,
@@ -25,8 +22,11 @@ pub async fn attestation_digest_from_cert(
     let vendor = attestation
         .detect_vendor_from_quote()
         .context("failed to classify RA-TLS quote vendor while deriving digest")?;
-    reject_unsupported_verified_ratls_vendor(vendor)
-        .context("unsupported RA-TLS vendor for attestation digest derivation")?;
+    if matches!(vendor, TEEVendor::UnsupportedQuoteFormat) {
+        bail!(
+            "unsupported RA-TLS quote format; this build verifies Intel SGX and TDX DCAP evidence"
+        );
+    }
 
     let (_, parsed_cert) = parse_x509_certificate(cert.as_ref()).map_err(|error| {
         anyhow!("failed to parse X.509 certificate for attestation digest: {error}")
@@ -64,17 +64,4 @@ pub async fn attestation_digest_from_cert(
     }
 
     Ok(Some(hasher.finalize().into()))
-}
-
-pub async fn attestation_digest_from_pem_bundle(
-    pem_bundle: &[u8],
-    pccs_url: Option<&str>,
-) -> Result<Option<[u8; 32]>> {
-    let cert = certs(&mut Cursor::new(pem_bundle))
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .context("failed to parse certificate PEM bundle for attestation digest")?
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow!("certificate PEM bundle did not contain any certificates"))?;
-    attestation_digest_from_cert(&cert, pccs_url).await
 }

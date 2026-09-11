@@ -75,7 +75,6 @@ pub struct PerformanceMetrics {
     pub average_latency_ms: f64,
     pub min_latency_ms: f64,
     pub max_latency_ms: f64,
-    pub throughput_ops_per_second: f64,
 }
 
 /// Performance monitor for crypto operations
@@ -130,7 +129,6 @@ impl PerformanceMonitor {
                 average_latency_ms: 0.0,
                 min_latency_ms: f64::MAX,
                 max_latency_ms: 0.0,
-                throughput_ops_per_second: 0.0,
             });
 
         metrics.operation_count += 1;
@@ -240,79 +238,5 @@ impl PerformanceMonitor {
     ) -> Result<Option<PerformanceMetrics>, anyhow::Error> {
         let cache = self.metrics_cache.read().await;
         Ok(cache.get(operation_type).cloned())
-    }
-
-    /// Get all metrics
-    pub async fn get_all_metrics(
-        &self,
-    ) -> Result<HashMap<String, PerformanceMetrics>, anyhow::Error> {
-        let cache = self.metrics_cache.read().await;
-        Ok(cache.clone())
-    }
-
-    /// Export metrics in Prometheus format
-    pub async fn export_prometheus(&self) -> Result<String, anyhow::Error> {
-        use prometheus::Encoder;
-        use prometheus::TextEncoder;
-
-        let encoder = TextEncoder::new();
-        let metric_families = prometheus::gather();
-        let mut buffer = Vec::new();
-        encoder.encode(&metric_families, &mut buffer)?;
-
-        let metrics_output = String::from_utf8(buffer)?;
-        Ok(metrics_output)
-    }
-
-    /// Reset all metrics
-    pub async fn reset_metrics(&self) -> Result<(), anyhow::Error> {
-        // Reset Prometheus metrics
-        self.operation_count.reset();
-        self.operation_duration.reset();
-        self.active_operations.reset();
-        self.error_count.reset();
-        self.memory_usage.reset();
-        self.cpu_usage.reset();
-
-        // Reset cache
-        let mut cache = self.metrics_cache.write().await;
-        cache.clear();
-
-        info!("All performance metrics reset");
-        Ok(())
-    }
-
-    /// Get summary statistics
-    pub async fn get_summary(&self) -> Result<HashMap<String, serde_json::Value>, anyhow::Error> {
-        let mut summary = HashMap::new();
-
-        let cache = self.metrics_cache.read().await;
-        let total_operations: u64 = cache.values().map(|m| m.operation_count).sum();
-        let avg_latency = if total_operations > 0 {
-            cache
-                .values()
-                .map(|m| m.average_latency_ms * m.operation_count as f64)
-                .sum::<f64>()
-                / total_operations as f64
-        } else {
-            0.0
-        };
-
-        summary.insert("total_operations".to_string(), total_operations.into());
-        summary.insert("average_latency_ms".to_string(), avg_latency.into());
-        summary.insert("operation_types".to_string(), cache.len().into());
-        summary.insert(
-            "timestamp".to_string(),
-            chrono::Utc::now().to_rfc3339().into(),
-        );
-
-        Ok(summary)
-    }
-
-    /// Health check for performance monitor
-    pub async fn health_check(&self) -> Result<bool, anyhow::Error> {
-        // Check if we can record a test metric
-        self.record_operation("health_check", 1.0).await?;
-        Ok(true)
     }
 }

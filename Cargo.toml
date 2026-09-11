@@ -4,7 +4,6 @@ members = ["crates/secret-broker-client", "services/secret-broker"]
 
 [workspace.package]
 edition = "2021"
-license = "MIT"
 rust-version = "1.82"
 
 [workspace.dependencies]

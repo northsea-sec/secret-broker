@@ -133,11 +133,6 @@ impl Caveat {
             other => Err(MacaroonError::UnknownCaveat(other.to_string())),
         }
     }
-
-    /// Returns true if this is a third-party caveat requiring a discharge.
-    pub fn is_third_party(&self) -> bool {
-        matches!(self, Caveat::ThirdParty { .. })
-    }
 }
 
 /// Chained-HMAC macaroon.
@@ -169,6 +164,21 @@ impl Macaroon {
         let encoded = caveat.encode();
         self.signature = hmac_compute(&self.signature, encoded.as_bytes());
         self.caveats.push(encoded);
+    }
+
+    /// Verify only the chained-HMAC authenticity of this capability.
+    ///
+    /// Management operations use this before loading or mutating state. Unwrap
+    /// additionally calls [`Self::verify`] to enforce every caveat.
+    pub fn verify_signature(&self, root_key: &[u8; 32]) -> Result<(), MacaroonError> {
+        let mut sig = hmac_compute(root_key, self.identifier.as_bytes());
+        for caveat in &self.caveats {
+            sig = hmac_compute(&sig, caveat.as_bytes());
+        }
+        if sig.ct_eq(&self.signature).unwrap_u8() == 0 {
+            return Err(MacaroonError::SignatureInvalid);
+        }
+        Ok(())
     }
 
     /// Verify the HMAC chain and all caveats against the provided context.
@@ -317,17 +327,6 @@ pub struct DischargeMacaroon {
 }
 
 impl DischargeMacaroon {
-    /// Mint a discharge proving `condition` was satisfied and bind it to the
-    /// provided primary macaroon signature.
-    pub fn mint(
-        location: &str,
-        condition: &str,
-        discharge_key: &[u8; 32],
-        primary_signature: &[u8; 32],
-    ) -> Self {
-        Self::mint_with_expiry(location, condition, discharge_key, primary_signature, None)
-    }
-
     pub fn mint_with_expiry(
         location: &str,
         condition: &str,
@@ -487,6 +486,7 @@ pub struct DischargeKeyRef {
 
 impl CaveatVerifier {
     /// Create a verifier with only first-party context (no discharges).
+    #[cfg(test)]
     pub fn first_party_only(
         tenant_id: Option<String>,
         provider: Option<String>,
@@ -657,6 +657,10 @@ mod tests {
         let encoded = macaroon.serialize();
         let mut tampered = Macaroon::deserialize(&encoded).unwrap();
         tampered.caveats.pop();
+        assert!(matches!(
+            tampered.verify_signature(&key),
+            Err(MacaroonError::SignatureInvalid)
+        ));
         assert!(matches!(
             tampered.verify(&key, &verifier(Utc::now())),
             Err(MacaroonError::SignatureInvalid)

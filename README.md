@@ -5,7 +5,8 @@ Secret Broker is a Rust workspace for issuing, storing, and recovering secrets t
 - `secret-broker-client`: a typed client whose only public connection path requires explicit mTLS identity, trust roots, server name, and an attestation mode.
 - `secret-broker`: the standalone broker service and the `secretbroker.v1` protocol.
 
-The workspace declares the MIT license in its Cargo metadata.
+Copyright is held by the repository owner. All rights are reserved; no software
+license is granted until the owner explicitly selects one.
 
 ## What the broker does
 
@@ -17,7 +18,12 @@ The protocol exposes these groups of operations:
 - encrypt/decrypt, sign/verify, generate random bytes, generate post-quantum key pairs, and retrieve their public keys;
 - optionally issue temporary PostgreSQL credentials when the broker is configured with an administrative PostgreSQL connection.
 
-Secrets use the `secretbroker.v1` gRPC package. The complete wire contract is in [`proto/secret_broker.proto`](proto/secret_broker.proto).
+Secrets use the `secretbroker.v1` gRPC package. The `.v1` suffix versions the wire
+namespace; it is not the capability-handle version. Every externally usable
+secret handle is a signed, serialized Macaroon prefixed with `broker:v2:`. The
+service rejects bare UUIDs, `broker:v1:` handles, and unsigned
+`broker:v2:<uuid>` values before looking up sealed state. The complete wire
+contract is in [`proto/secret_broker.proto`](proto/secret_broker.proto).
 
 ## Build and verify
 
@@ -38,9 +44,11 @@ The public client has exactly two modes:
 | `enforced` (default) | Any non-loopback endpoint | HTTPS; client certificate, key, CA bundle, and server name; a non-empty measured-identity policy; a non-empty server-subject allowlist; and `SECRET_BROKER_PCCS_URL`. The client verifies the ordinary TLS chain before RA-TLS evidence, PCCS collateral, measurements, and subject policy. |
 | `local` | Controlled loopback integration only | HTTPS plus mTLS. The client rejects `local` for non-loopback endpoints and does not accept an attestation policy, subject list, or PCCS URL in this mode. |
 
-There is no public disabled, stub, SPIFFE-only, permissive-verifier, or allow-all client mode. A client connection is established eagerly; consumers cannot construct the underlying transport directly.
+There is no public disabled, stub, SPIFFE-only, permissive-verifier, or allow-all client mode. A client connection is established eagerly, the generated gRPC module and protocol adapter are private, and consumers cannot construct the underlying transport directly.
 
-The standalone broker requires a client certificate and derives the authenticated principal from a SPIFFE URI SAN. It derives TLS-exporter context from the live mTLS connection. Peer attestation and discharge-attestation checks default to enabled. A controlled local integration test may explicitly turn them off only when exercising local mTLS without RA-TLS evidence; that is not an attestation substitute.
+The enforced RA-TLS verifier accepts Intel SGX and Intel TDX DCAP quote formats that it can validate with PCCS collateral. An unrecognized quote header is rejected as unsupported; the code does not infer a vendor it cannot verify.
+
+The standalone broker requires a client certificate and derives the authenticated principal from a SPIFFE URI SAN. It derives TLS-exporter context from the live mTLS connection. Peer attestation and discharge-attestation checks default to enabled. A controlled local integration test may set `SECRET_BROKER_REQUIRE_ATTESTATION=false` and `BROKER_REQUIRE_DISCHARGE_ATTESTATION=false` while exercising loopback mTLS without RA-TLS evidence. Startup rejects either relaxation on a non-loopback bind; local mTLS is not an attestation substitute.
 
 ## Broker configuration
 
@@ -65,8 +73,11 @@ Common explicit state variables:
 | `CRYPTO_ENGINE_SEALED_STORE_PATH` | Post-quantum crypto-state path. |
 | `CRYPTO_ENGINE_HSM_TYPE` | This build accepts only `software`; another value is rejected. |
 | `SECRET_BROKER_PCCS_URL` | The sole PCCS configuration name used for RA-TLS verification. |
+| `SECRET_BROKER_REQUIRE_ATTESTATION` | Require peer RA-TLS evidence; defaults to `true`, and may be `false` only on a loopback bind. |
+| `BROKER_REQUIRE_DISCHARGE_ATTESTATION` | Require attested discharge minting; defaults to `true`, and may be `false` only on a loopback bind. |
+| `BROKER_DISCHARGE_PRINCIPAL_ALLOWLIST` | Optional comma-separated SPIFFE principals allowed to mint discharges. |
 
-Do not place a master key, certificate private key, policy secret, or runtime state in this repository.
+See [`.env.example`](.env.example) for a secret-free configuration template. Do not place a master key, certificate private key, policy secret, or runtime state in this repository.
 
 ## Client configuration
 
@@ -163,9 +174,17 @@ These sources informed the concepts used here; they do not independently validat
 - Knauth et al., [*Integrating Remote Attestation with Transport Layer Security*](https://arxiv.org/abs/1801.05863), 2018. It describes binding remote-attestation evidence to standard TLS setup without changing TLS itself, the design context for the enforced RA-TLS client path.
 - NIST, [FIPS 203: Module-Lattice-Based Key-Encapsulation Mechanism Standard](https://csrc.nist.gov/pubs/fips/203/final), 2024. It specifies ML-KEM and its three parameter sets.
 - NIST, [FIPS 204: Module-Lattice-Based Digital Signature Standard](https://csrc.nist.gov/pubs/fips/204/final), 2024. It specifies ML-DSA, used by the implementation's Dilithium/ML-DSA signing path.
+- Shamir, [*How to Share a Secret*](https://doi.org/10.1145/359168.359176), 1979. It defines the polynomial secret-sharing construction used for threshold redeem material.
+- Feldman, [*A Practical Scheme for Non-interactive Verifiable Secret Sharing*](https://doi.org/10.1109/SFCS.1987.4), 1987. It provides the commitment model used to verify threshold shares.
+- IETF, [RFC 5705: Keying Material Exporters for TLS](https://www.rfc-editor.org/rfc/rfc5705), 2010. It defines the exporter construction used to bind broker requests to their authenticated TLS session.
+
+## Security and disclosure
+
+See [`SECURITY.md`](SECURITY.md) for the supported reporting channel, threat boundaries, and handling guidance. Never include live secrets, private keys, macaroons, discharge tokens, or database URLs in a report.
 
 ## Scope boundaries
 
 - This repository does not create or distribute CA material, private keys, PCCS collateral, measurement policies, or runtime state.
 - PostgreSQL credential issuance is unavailable unless the broker is explicitly configured with its required PostgreSQL administration settings.
 - A remote endpoint cannot use local mode. Invalid trust configuration returns an error; it is not silently downgraded.
+- This repository is published for inspection without a software license; all rights are reserved unless and until the owner adds one.

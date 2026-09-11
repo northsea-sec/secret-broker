@@ -121,9 +121,8 @@ impl CryptoConfig {
         let max_keys_per_customer = env::var("CRYPTO_ENGINE_MAX_KEYS_PER_CUSTOMER")
             .ok()
             .and_then(|v| v.parse().ok())
-            // Hidden-handoff proof lanes can mint many short-lived broker artifacts in a
-            // single session, so the runtime default must not self-exhaust after a couple
-            // of rotations or retries.
+            // A broker may mint many short-lived keys during normal rotation-heavy
+            // workloads, so the default should not self-exhaust prematurely.
             .unwrap_or(10_000);
 
         Self {

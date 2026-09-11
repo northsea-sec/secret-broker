@@ -37,13 +37,13 @@ use crate::ra_tls::{
     vendor::TEEVendor,
 };
 use crate::{
-    broker_proto, AttenuateHandleV2Params, AttenuateHandleV2Result, ClaimShareResult,
-    CryptoDecryptParams, CryptoDecryptResult, CryptoEncryptParams, CryptoEncryptResult,
-    CryptoKeyPairResult, CryptoKeygenParams, CryptoSignParams, CryptoVerifyParams,
-    MintAeadKeyV2Lease, MintAeadKeyV2Params, MintDischargeParams, PostgresCredentialLease,
-    PostgresCredentialParams, RenewLeaseResult, RevokeResult, RotateParams, RotateResult,
-    SecretBrokerGrpcAdapter, SecretBrokerGrpcAdapterConfig, ThresholdShareMaterial,
-    UnwrapSecretV2Params, WrapResponse, WrapV2Params,
+    AttenuateHandleV2Params, AttenuateHandleV2Result, ClaimShareResult, CryptoDecryptParams,
+    CryptoDecryptResult, CryptoEncryptParams, CryptoEncryptResult, CryptoKeyPairResult,
+    CryptoKeygenParams, CryptoSignParams, CryptoVerifyParams, MintAeadKeyV2Lease,
+    MintAeadKeyV2Params, MintDischargeParams, PostgresCredentialLease, PostgresCredentialParams,
+    RenewLeaseResult, RevokeResult, RotateParams, RotateResult, SecretBrokerGrpcAdapter,
+    SecretBrokerGrpcAdapterConfig, ThresholdShareMaterial, UnwrapSecretV2Params, WrapResponse,
+    WrapV2Params,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -419,10 +419,6 @@ impl SecretBrokerClient {
 
     pub fn endpoint(&self) -> &Url {
         self.adapter.endpoint()
-    }
-
-    pub async fn describe_channel(&self) -> Result<broker_proto::DescribeChannelResponse> {
-        self.adapter.describe_channel().await
     }
 
     pub async fn wrap_bytes_v2(
@@ -927,9 +923,11 @@ async fn verify_peer_certificate(
     })?;
     if matches!(
         attestation.detect_vendor_from_quote()?,
-        TEEVendor::AmdSevSnp
+        TEEVendor::UnsupportedQuoteFormat
     ) {
-        bail!("AMD SEV-SNP RA-TLS verification is not implemented by this client and is rejected");
+        bail!(
+            "unsupported RA-TLS quote format; this client verifies Intel SGX and TDX DCAP evidence"
+        );
     }
     let public_key = certificate_view
         .public_key()

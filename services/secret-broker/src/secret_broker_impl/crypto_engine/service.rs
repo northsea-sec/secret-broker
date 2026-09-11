@@ -1,11 +1,8 @@
 use anyhow::Result;
 use chrono::Utc;
-use parking_lot::RwLock;
 use rand::RngCore;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::broadcast;
-use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use super::config::CryptoConfig;
@@ -24,72 +21,10 @@ pub struct CryptoEngineService {
     quantum_crypto: Arc<QuantumResistantCrypto>,
     hsm: Option<Arc<HardwareSecurityModule>>,
     pub(crate) performance_monitor: Arc<PerformanceMonitor>,
-    // Communication channels
-    encryption_requests_tx: mpsc::UnboundedSender<EncryptionRequest>,
-    encryption_requests_rx: Arc<RwLock<Option<mpsc::UnboundedReceiver<EncryptionRequest>>>>,
-    decryption_requests_tx: mpsc::UnboundedSender<DecryptionRequest>,
-    decryption_requests_rx: Arc<RwLock<Option<mpsc::UnboundedReceiver<DecryptionRequest>>>>,
-    // Event streaming for real-time monitoring
-    event_broadcaster: broadcast::Sender<CryptoEvent>,
 }
 
 // Re-export request types from the engine module to avoid duplication
 pub use super::engine::{DecryptionRequest, EncryptionRequest};
-
-/// Crypto events for real-time monitoring and audit logging
-#[derive(Debug, Clone)]
-pub enum CryptoEvent {
-    EncryptionStarted {
-        request_id: String,
-        customer_id: String,
-        algorithm: String,
-        timestamp: chrono::DateTime<Utc>,
-    },
-    EncryptionCompleted {
-        request_id: String,
-        customer_id: String,
-        success: bool,
-        duration_ms: u64,
-        timestamp: chrono::DateTime<Utc>,
-    },
-    DecryptionStarted {
-        request_id: String,
-        customer_id: String,
-        algorithm: String,
-        timestamp: chrono::DateTime<Utc>,
-    },
-    DecryptionCompleted {
-        request_id: String,
-        customer_id: String,
-        success: bool,
-        duration_ms: u64,
-        timestamp: chrono::DateTime<Utc>,
-    },
-    KeyGenerated {
-        key_id: String,
-        algorithm: String,
-        customer_id: String,
-        timestamp: chrono::DateTime<Utc>,
-    },
-    KeyRotated {
-        old_key_id: String,
-        new_key_id: String,
-        customer_id: String,
-        timestamp: chrono::DateTime<Utc>,
-    },
-    SecurityAlert {
-        alert_type: String,
-        message: String,
-        severity: String,
-        timestamp: chrono::DateTime<Utc>,
-    },
-    PerformanceMetric {
-        metric_name: String,
-        value: f64,
-        unit: String,
-        timestamp: chrono::DateTime<Utc>,
-    },
-}
 
 /// Encryption algorithms
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,10 +32,8 @@ pub enum EncryptionAlgorithm {
     Aes256Gcm,
     ChaCha20Poly1305,
     XChaCha20Poly1305,
-    // Post-Quantum Cryptography - NIST Standards
-    Kyber512,
-    Kyber768, // Primary PQC algorithm
-    Kyber1024,
+    // ML-KEM-768 hybrid encryption.
+    Kyber768,
 }
 
 impl CryptoEngineService {
@@ -124,215 +57,20 @@ impl CryptoEngineService {
             None
         };
 
-        // Create communication channels
-        let (encryption_requests_tx, encryption_requests_rx) = mpsc::unbounded_channel();
-        let (decryption_requests_tx, decryption_requests_rx) = mpsc::unbounded_channel();
-
-        // Create event broadcasting channel for real-time monitoring
-        let (event_broadcaster, _) = broadcast::channel(1000); // Buffer up to 1000 events
-
-        let mut service = Self {
+        let service = Self {
             config,
             crypto_engine,
             key_manager,
             quantum_crypto,
             hsm,
             performance_monitor,
-            encryption_requests_tx,
-            encryption_requests_rx: Arc::new(RwLock::new(Some(encryption_requests_rx))),
-            decryption_requests_tx,
-            decryption_requests_rx: Arc::new(RwLock::new(Some(decryption_requests_rx))),
-            event_broadcaster,
         };
-
-        // Initialize crypto processing pipeline
-        service.initialize_crypto_pipeline().await?;
 
         // Start background tasks
         service.start_background_tasks().await?;
 
         info!(" CryptoEngine service initialized successfully");
         Ok(service)
-    }
-
-    /// Initialize crypto processing pipeline
-    async fn initialize_crypto_pipeline(&mut self) -> Result<()> {
-        info!("Initializing crypto processing pipeline");
-
-        // Start encryption processor
-        let mut encryption_receiver = self
-            .encryption_requests_rx
-            .write()
-            .take()
-            .expect("encryption receiver already taken");
-        let crypto_engine = self.crypto_engine.clone();
-        let key_manager = self.key_manager.clone();
-        let quantum_crypto = self.quantum_crypto.clone();
-        let performance_monitor = self.performance_monitor.clone();
-        let event_broadcaster = self.event_broadcaster.clone();
-
-        tokio::spawn(async move {
-            while let Some(request) = encryption_receiver.recv().await {
-                let start_time = std::time::Instant::now();
-                debug!("Processing encryption request: {}", request.id);
-
-                // Broadcast encryption started event
-                let _ = event_broadcaster.send(CryptoEvent::EncryptionStarted {
-                    request_id: request.id.clone(),
-                    customer_id: request.customer_id.clone(),
-                    algorithm: format!("{:?}", request.algorithm),
-                    timestamp: chrono::Utc::now(),
-                });
-
-                let result = match request.algorithm {
-                    EncryptionAlgorithm::Aes256Gcm
-                    | EncryptionAlgorithm::ChaCha20Poly1305
-                    | EncryptionAlgorithm::XChaCha20Poly1305 => {
-                        crypto_engine.process_encryption_request(&request).await
-                    }
-                    EncryptionAlgorithm::Kyber512
-                    | EncryptionAlgorithm::Kyber768
-                    | EncryptionAlgorithm::Kyber1024 => {
-                        quantum_crypto.process_encryption_request(&request).await
-                    }
-                };
-
-                let duration = start_time.elapsed();
-                let _ = performance_monitor
-                    .record_operation("encryption", duration.as_millis() as f64)
-                    .await;
-
-                match result {
-                    Ok(encrypted_data) => {
-                        debug!(
-                            "Encryption completed for request: {} ({}ms)",
-                            request.id,
-                            duration.as_millis()
-                        );
-
-                        // Broadcast encryption completed event
-                        let _ = event_broadcaster.send(CryptoEvent::EncryptionCompleted {
-                            request_id: request.id.clone(),
-                            customer_id: request.customer_id.clone(),
-                            success: true,
-                            duration_ms: duration.as_millis() as u64,
-                            timestamp: chrono::Utc::now(),
-                        });
-
-                        // Update key usage statistics in key manager
-                        if let Some(key_id) = &encrypted_data.key_id {
-                            if let Err(err) = key_manager.update_key_usage(key_id).await {
-                                warn!(?err, "failed to update key usage after encryption");
-                            }
-                        }
-
-                        info!(
-                            " Encryption successful - {} bytes encrypted",
-                            encrypted_data.ciphertext.len()
-                        );
-                    }
-                    Err(e) => {
-                        error!("Encryption failed for request: {}: {}", request.id, e);
-
-                        // Broadcast encryption failed event
-                        let _ = event_broadcaster.send(CryptoEvent::EncryptionCompleted {
-                            request_id: request.id.clone(),
-                            customer_id: request.customer_id.clone(),
-                            success: false,
-                            duration_ms: duration.as_millis() as u64,
-                            timestamp: chrono::Utc::now(),
-                        });
-                    }
-                }
-            }
-        });
-
-        // Start decryption processor
-        let mut decryption_receiver = self
-            .decryption_requests_rx
-            .write()
-            .take()
-            .expect("decryption receiver already taken");
-        let crypto_engine = self.crypto_engine.clone();
-        let key_manager = self.key_manager.clone();
-        let quantum_crypto = self.quantum_crypto.clone();
-        let performance_monitor = self.performance_monitor.clone();
-        let event_broadcaster = self.event_broadcaster.clone();
-
-        tokio::spawn(async move {
-            while let Some(request) = decryption_receiver.recv().await {
-                let start_time = std::time::Instant::now();
-                debug!("Processing decryption request: {}", request.id);
-
-                // Broadcast decryption started event
-                let _ = event_broadcaster.send(CryptoEvent::DecryptionStarted {
-                    request_id: request.id.clone(),
-                    customer_id: request.customer_id.clone(),
-                    algorithm: format!("{:?}", request.algorithm),
-                    timestamp: chrono::Utc::now(),
-                });
-
-                let result = match request.algorithm {
-                    EncryptionAlgorithm::Aes256Gcm
-                    | EncryptionAlgorithm::ChaCha20Poly1305
-                    | EncryptionAlgorithm::XChaCha20Poly1305 => {
-                        crypto_engine.process_decryption_request(&request).await
-                    }
-                    EncryptionAlgorithm::Kyber512
-                    | EncryptionAlgorithm::Kyber768
-                    | EncryptionAlgorithm::Kyber1024 => {
-                        quantum_crypto.process_decryption_request(&request).await
-                    }
-                };
-
-                let duration = start_time.elapsed();
-                let _ = performance_monitor
-                    .record_operation("decryption", duration.as_millis() as f64)
-                    .await;
-
-                match result {
-                    Ok(decrypted_data) => {
-                        debug!(
-                            "Decryption completed for request: {} ({}ms)",
-                            request.id,
-                            duration.as_millis()
-                        );
-
-                        // Broadcast decryption completed event
-                        let _ = event_broadcaster.send(CryptoEvent::DecryptionCompleted {
-                            request_id: request.id.clone(),
-                            customer_id: request.customer_id.clone(),
-                            success: true,
-                            duration_ms: duration.as_millis() as u64,
-                            timestamp: chrono::Utc::now(),
-                        });
-
-                        if let Err(err) = key_manager.update_key_usage(&request.key_id).await {
-                            warn!(?err, "failed to update key usage after decryption");
-                        }
-
-                        info!(
-                            " Decryption successful - {} bytes decrypted",
-                            decrypted_data.plaintext.len()
-                        );
-                    }
-                    Err(e) => {
-                        error!("Decryption failed for request: {}: {}", request.id, e);
-
-                        // Broadcast decryption failed event
-                        let _ = event_broadcaster.send(CryptoEvent::DecryptionCompleted {
-                            request_id: request.id.clone(),
-                            customer_id: request.customer_id.clone(),
-                            success: false,
-                            duration_ms: duration.as_millis() as u64,
-                            timestamp: chrono::Utc::now(),
-                        });
-                    }
-                }
-            }
-        });
-
-        Ok(())
     }
 
     /// Start background tasks
@@ -385,17 +123,6 @@ impl CryptoEngineService {
         Ok(())
     }
 
-    /// Encrypt data
-    pub async fn encrypt_data(
-        &self,
-        data: &[u8],
-        algorithm: EncryptionAlgorithm,
-        customer_id: &str,
-    ) -> Result<EncryptionResult> {
-        self.encrypt_data_with_key(data, algorithm, None, customer_id)
-            .await
-    }
-
     /// Encrypt data, optionally pinning the operation to a specific key.
     pub async fn encrypt_data_with_key(
         &self,
@@ -415,8 +142,6 @@ impl CryptoEngineService {
             exporter_secret: None,
         };
 
-        self.encryption_requests_tx.send(request.clone())?;
-
         let algo_str = format!("{:?}", algorithm);
         let _ = self
             .performance_monitor
@@ -433,9 +158,7 @@ impl CryptoEngineService {
                     .process_encryption_request(&request)
                     .await
             }
-            EncryptionAlgorithm::Kyber512
-            | EncryptionAlgorithm::Kyber768
-            | EncryptionAlgorithm::Kyber1024 => {
+            EncryptionAlgorithm::Kyber768 => {
                 self.quantum_crypto
                     .process_encryption_request(&request)
                     .await
@@ -496,8 +219,6 @@ impl CryptoEngineService {
             exporter_secret: None,
         };
 
-        self.decryption_requests_tx.send(request.clone())?;
-
         let algo_str = format!("{:?}", algorithm);
         let _ = self
             .performance_monitor
@@ -518,9 +239,7 @@ impl CryptoEngineService {
                     .process_decryption_request(&request)
                     .await
             }
-            EncryptionAlgorithm::Kyber512
-            | EncryptionAlgorithm::Kyber768
-            | EncryptionAlgorithm::Kyber1024 => {
+            EncryptionAlgorithm::Kyber768 => {
                 self.quantum_crypto
                     .process_decryption_request(&request)
                     .await
@@ -609,17 +328,9 @@ impl CryptoEngineService {
 
     /// Generate new key pair
     pub async fn generate_key_pair(&self, algorithm: &str, customer_id: &str) -> Result<KeyPair> {
-        let keypair = self
-            .key_manager
+        self.key_manager
             .generate_key_pair(algorithm, customer_id)
-            .await?;
-        let _ = self.event_broadcaster.send(CryptoEvent::KeyGenerated {
-            key_id: keypair.key_id.clone(),
-            algorithm: keypair.algorithm.clone(),
-            customer_id: customer_id.to_string(),
-            timestamp: Utc::now(),
-        });
-        Ok(keypair)
+            .await
     }
 
     /// Get public key
@@ -665,35 +376,6 @@ impl CryptoEngineService {
             let mut bytes = vec![0u8; length];
             rand::thread_rng().fill_bytes(&mut bytes);
             Ok(bytes)
-        }
-    }
-
-    /// Get performance metrics
-    pub async fn get_performance_metrics(&self) -> Result<HashMap<String, f64>> {
-        let metrics_result = self.performance_monitor.get_metrics("overall").await?;
-        match metrics_result {
-            Some(metrics) => {
-                let mut result = HashMap::new();
-                result.insert(
-                    "operations_per_second".to_string(),
-                    metrics.throughput_ops_per_second,
-                );
-                result.insert("average_latency_ms".to_string(), metrics.average_latency_ms);
-                result.insert("error_rate".to_string(), 0.0);
-                result.insert(
-                    "total_operations".to_string(),
-                    metrics.operation_count as f64,
-                );
-                Ok(result)
-            }
-            None => {
-                let mut result = HashMap::new();
-                result.insert("operations_per_second".to_string(), 0.0);
-                result.insert("average_latency_ms".to_string(), 0.0);
-                result.insert("error_rate".to_string(), 0.0);
-                result.insert("total_operations".to_string(), 0.0);
-                Ok(result)
-            }
         }
     }
 
@@ -747,25 +429,6 @@ impl CryptoEngineService {
         health.insert("overall".to_string(), overall.to_string());
 
         Ok(health)
-    }
-
-    /// Shutdown service gracefully
-    pub async fn shutdown(&self) -> Result<()> {
-        info!(" Shutting down CryptoEngine service");
-
-        if let Some(hsm) = &self.hsm {
-            if let Err(e) = hsm.shutdown().await {
-                warn!("Error shutting down HSM: {}", e);
-            }
-        }
-
-        info!(" CryptoEngine service shutdown complete");
-        Ok(())
-    }
-
-    /// Access to event broadcaster for streaming consumers
-    pub fn event_broadcaster(&self) -> broadcast::Sender<CryptoEvent> {
-        self.event_broadcaster.clone()
     }
 
     /// Run comprehensive startup diagnostics exercising all subsystems.
@@ -897,52 +560,7 @@ impl CryptoEngineService {
             }
         }
 
-        // 8. Event broadcaster - emit diagnostic events covering all variant types
-        let _ = self.event_broadcaster.send(CryptoEvent::SecurityAlert {
-            alert_type: "startup_diagnostic".to_string(),
-            message: "crypto engine startup diagnostics passed".to_string(),
-            severity: "info".to_string(),
-            timestamp: Utc::now(),
-        });
-        let _ = self.event_broadcaster.send(CryptoEvent::KeyRotated {
-            old_key_id: "__diag_old__".to_string(),
-            new_key_id: "__diag_new__".to_string(),
-            customer_id: "__diagnostic__".to_string(),
-            timestamp: Utc::now(),
-        });
-        let _ = self.event_broadcaster.send(CryptoEvent::PerformanceMetric {
-            metric_name: "startup_diagnostics".to_string(),
-            value: 1.0,
-            unit: "completed".to_string(),
-            timestamp: Utc::now(),
-        });
-
         info!("crypto engine startup diagnostics complete - all subsystems operational");
         Ok(())
-    }
-
-    /// Delegates to shutdown::wait_for_termination (wires the free function into the service)
-    pub async fn wait_for_termination(&self) -> Result<(), anyhow::Error> {
-        shutdown::wait_for_termination(self).await
-    }
-}
-
-pub mod shutdown {
-    use super::{CryptoEngineService, Result};
-    use tokio::signal;
-    use tracing::{error, info};
-
-    /// Helper to block on CTRL+C and invoke graceful shutdown.
-    pub async fn wait_for_termination(service: &CryptoEngineService) -> Result<()> {
-        match signal::ctrl_c().await {
-            Ok(()) => {
-                info!(" Shutdown signal received");
-            }
-            Err(err) => {
-                error!(" Unable to listen for shutdown signal: {}", err);
-            }
-        }
-
-        service.shutdown().await
     }
 }

@@ -1,7 +1,4 @@
-//! Shared SecretBrokerService gRPC implementation.
-//!
-//! This server is used by the standalone broker runtime and can also service a
-//! synthetic local context during dev-only test flows.
+//! SecretBrokerService implementation for the standalone authenticated runtime.
 
 use std::sync::Arc;
 
@@ -12,50 +9,31 @@ use prost_types::Timestamp;
 use tonic::{Request, Response, Status};
 
 use crate::secret_broker_impl::crypto_engine::service::EncryptionAlgorithm;
-use crate::secret_broker_impl::{handlers, BrokerClientContext, EmbeddedBrokerState};
+use crate::secret_broker_impl::{handlers, BrokerClientContext, SecretBrokerState};
 use crate::secret_broker_proto::secret_broker_service_server::SecretBrokerService;
 use crate::secret_broker_proto::*;
 use sha2::{Digest, Sha256};
 
 #[derive(Clone)]
-pub struct SecretBrokerGrpc {
-    state: Arc<EmbeddedBrokerState>,
-    is_dev_mode: bool,
+pub(crate) struct SecretBrokerGrpc {
+    state: Arc<SecretBrokerState>,
 }
 
 impl SecretBrokerGrpc {
-    pub fn new(state: Arc<EmbeddedBrokerState>, is_dev_mode: bool) -> Self {
-        Self { state, is_dev_mode }
-    }
-
-    /// Synthetic embedded broker context is dev-only. Non-dev deployments must use
-    /// the standalone broker with real mTLS channel context on every request.
-    fn require_dev_mode(&self) -> Result<(), Status> {
-        if self.is_dev_mode {
-            return Ok(());
-        }
-        Err(Status::failed_precondition(
-            "synthetic embedded broker context is dev-only; non-dev deployments must use the standalone broker with real mTLS/SPIFFE channel context"
-        ))
+    pub(crate) fn new(state: Arc<SecretBrokerState>) -> Self {
+        Self { state }
     }
 
     fn request_context<T>(&self, request: &Request<T>) -> Option<BrokerClientContext> {
         request.extensions().get::<BrokerClientContext>().cloned()
     }
 
-    fn require_request_or_embedded_mode<T>(&self, request: &Request<T>) -> Result<(), Status> {
-        if self.request_context(request).is_some() {
-            return Ok(());
-        }
-        self.require_dev_mode()
-    }
-
     fn broker_context<T>(&self, request: &Request<T>) -> Result<BrokerClientContext, Status> {
-        if let Some(context) = self.request_context(request) {
-            return Ok(context);
-        }
-        self.require_dev_mode()?;
-        Ok(self.state.context.clone())
+        self.request_context(request).ok_or_else(|| {
+            Status::failed_precondition(
+                "secret-broker requests require authenticated live mTLS connection context",
+            )
+        })
     }
 }
 
@@ -433,7 +411,7 @@ impl SecretBrokerService for SecretBrokerGrpc {
         &self,
         request: Request<CryptoEncryptRequest>,
     ) -> Result<Response<CryptoEncryptResponse>, Status> {
-        self.require_request_or_embedded_mode(&request)?;
+        let _context = self.broker_context(&request)?;
         let req = request.into_inner();
         let key_id = empty_to_none(req.key_id);
         let result = self
@@ -460,7 +438,7 @@ impl SecretBrokerService for SecretBrokerGrpc {
         &self,
         request: Request<CryptoDecryptRequest>,
     ) -> Result<Response<CryptoDecryptResponse>, Status> {
-        self.require_request_or_embedded_mode(&request)?;
+        let _context = self.broker_context(&request)?;
         let req = request.into_inner();
         let key_id = req.key_id.trim();
         if key_id.is_empty() {
@@ -489,7 +467,7 @@ impl SecretBrokerService for SecretBrokerGrpc {
         &self,
         request: Request<CryptoSignRequest>,
     ) -> Result<Response<CryptoSignResponse>, Status> {
-        self.require_request_or_embedded_mode(&request)?;
+        let _context = self.broker_context(&request)?;
         let req = request.into_inner();
         let key_id = req.key_id.trim();
         if key_id.is_empty() {
@@ -510,7 +488,7 @@ impl SecretBrokerService for SecretBrokerGrpc {
         &self,
         request: Request<CryptoVerifyRequest>,
     ) -> Result<Response<CryptoVerifyResponse>, Status> {
-        self.require_request_or_embedded_mode(&request)?;
+        let _context = self.broker_context(&request)?;
         let req = request.into_inner();
         let key_id = req.key_id.trim();
         if key_id.is_empty() {
@@ -531,7 +509,7 @@ impl SecretBrokerService for SecretBrokerGrpc {
         &self,
         request: Request<CryptoKeygenRequest>,
     ) -> Result<Response<CryptoKeygenResponse>, Status> {
-        self.require_request_or_embedded_mode(&request)?;
+        let _context = self.broker_context(&request)?;
         let req = request.into_inner();
         let algorithm = req.algorithm.trim();
         if algorithm.is_empty() {
@@ -556,7 +534,7 @@ impl SecretBrokerService for SecretBrokerGrpc {
         &self,
         request: Request<CryptoRandomRequest>,
     ) -> Result<Response<CryptoRandomResponse>, Status> {
-        self.require_request_or_embedded_mode(&request)?;
+        let _context = self.broker_context(&request)?;
         let req = request.into_inner();
         let random = self
             .state
@@ -576,7 +554,7 @@ impl SecretBrokerService for SecretBrokerGrpc {
         &self,
         request: Request<CryptoPubkeyRequest>,
     ) -> Result<Response<CryptoPubkeyResponse>, Status> {
-        self.require_request_or_embedded_mode(&request)?;
+        let _context = self.broker_context(&request)?;
         let req = request.into_inner();
         let key_id = req.key_id.trim();
         if key_id.is_empty() {
@@ -610,24 +588,14 @@ impl SecretBrokerService for SecretBrokerGrpc {
         &self,
         request: Request<DescribeChannelRequest>,
     ) -> Result<Response<DescribeChannelResponse>, Status> {
-        let context = if let Some(context) = self.request_context(&request) {
-            context
-        } else {
-            if !self.is_dev_mode {
-                return Err(Status::failed_precondition(
-                    "DescribeChannel with synthetic exporter is only available in dev mode; \
-                     production deployments must use a standalone broker with real TLS channel exporters"
-                ));
-            }
-            self.state.context.clone()
-        };
+        let context = self.broker_context(&request)?;
         let exporter = context.exporter().to_vec();
         let exporter_hash = Sha256::digest(&exporter).to_vec();
         Ok(Response::new(DescribeChannelResponse {
             session_id: context
                 .session_id()
-                .map(|session_id| session_id.to_string())
-                .unwrap_or_else(|| "embedded-dev".to_string()),
+                .ok_or_else(|| Status::internal("authenticated TLS context is missing session ID"))?
+                .to_string(),
             tls_exporter: exporter,
             tls_exporter_hash: exporter_hash,
             authenticated_transport: context.has_authenticated_transport(),
@@ -936,10 +904,10 @@ mod tests {
     use crate::secret_broker_impl::crypto_engine::{CryptoConfig, CryptoEngineService};
     use crate::secret_broker_impl::sealed_store::SealedStore;
     use crate::secret_broker_impl::state::{BrokerState, BrokerStateConfig};
-    use crate::secret_broker_impl::{BrokerClientContext, EmbeddedBrokerState};
+    use crate::secret_broker_impl::{BrokerClientContext, SecretBrokerState};
 
     struct TestBrokerHarness {
-        state: Arc<EmbeddedBrokerState>,
+        state: Arc<SecretBrokerState>,
         _sealed_store_dir: TempDir,
         _crypto_store_dir: TempDir,
     }
@@ -963,7 +931,7 @@ mod tests {
             .expect("create crypto engine service");
 
         TestBrokerHarness {
-            state: Arc::new(EmbeddedBrokerState {
+            state: Arc::new(SecretBrokerState {
                 broker: BrokerState::new(
                     crypto,
                     sealed_store,
@@ -976,7 +944,6 @@ mod tests {
                         redeem_token_ttl: chrono::Duration::hours(1),
                     },
                 ),
-                context: BrokerClientContext::synthetic_dev_context(vec![0u8; 32]),
             }),
             _sealed_store_dir: sealed_store_dir,
             _crypto_store_dir: crypto_store_dir,
@@ -994,27 +961,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_dev_broker_context_rejects_missing_connect_info() {
+    async fn broker_context_rejects_missing_live_connection() {
         let harness = test_broker_state().await;
-        let grpc = SecretBrokerGrpc::new(harness.state, false);
+        let grpc = SecretBrokerGrpc::new(harness.state);
 
         let err = grpc
             .broker_context(&Request::new(()))
-            .expect_err("non-dev broker must reject synthetic context without live connect info");
+            .expect_err("broker must reject requests without live mTLS context");
 
         assert_eq!(err.code(), Code::FailedPrecondition);
         assert!(
-            err.message()
-                .contains("synthetic embedded broker context is dev-only"),
+            err.message().contains("authenticated live mTLS"),
             "unexpected error: {err}"
         );
     }
 
     #[tokio::test]
-    async fn non_dev_broker_context_uses_request_connect_info() {
+    async fn broker_context_uses_authenticated_request_context() {
         let harness = test_broker_state().await;
-        let grpc = SecretBrokerGrpc::new(harness.state, false);
-        let expected = authenticated_context("spiffe://trust.example/tenant-agent", 17);
+        let grpc = SecretBrokerGrpc::new(harness.state);
+        let expected = authenticated_context("spiffe://trust.example/workload", 17);
         let mut request = Request::new(());
         request.extensions_mut().insert(expected.clone());
 

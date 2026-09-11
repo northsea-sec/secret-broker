@@ -1,1 +1,27 @@
 target/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.local.toml
+*.key
+*.pem
+*.crt
+*.p12
+*.pfx
+*.kdbx
+
+# Runtime state and generated evidence
+runtime/
+state/
+*.sled
+*.db
+*.db-*
+*.jsonl
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.swp
+.DS_Store

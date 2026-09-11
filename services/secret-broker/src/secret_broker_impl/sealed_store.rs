@@ -56,15 +56,6 @@ pub enum SecretLifecycle {
 }
 
 impl SecretLifecycle {
-    /// Wire format value matching the proto enum.
-    pub fn as_proto_i32(&self) -> i32 {
-        match self {
-            SecretLifecycle::SingleUseUnwrap => 0,
-            SecretLifecycle::RenewableLease => 1,
-            SecretLifecycle::ServiceBootstrap => 2,
-        }
-    }
-
     /// Parse from proto enum value.
     pub fn from_proto_i32(v: i32) -> Self {
         match v {
@@ -114,9 +105,7 @@ pub struct StoredEnvelopeRecord {
     pub threshold: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub threshold_commitments: Option<Vec<String>>,
-    /// Lifecycle class for this secret. Defaults to SingleUseUnwrap for
-    /// backward compatibility with pre-Phase-4 records.
-    #[serde(default)]
+    /// Explicit lifecycle class for this secret.
     pub lifecycle: SecretLifecycle,
     /// For RenewableLease: when the current lease period expires.
     /// Distinct from `expires_at` which is the hard secret TTL.
@@ -134,11 +123,11 @@ pub struct StoredEnvelopeRecord {
     /// Reason for revocation, if provided.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revocation_reason: Option<String>,
-    /// Phase 6a: Custodian->share index assignments for broker-held shares.
+    /// Custodian-to-index assignments for broker-held shares.
     /// Each entry maps a custodian_id to the share index (1-based) assigned to them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub share_assignments: Option<Vec<ShareAssignment>>,
-    /// Phase 6a: Broker-held threshold share material (y-values, base64-encoded).
+    /// Broker-held threshold share material (y-values, base64-encoded).
     /// Only present when custodian_ids were specified at mint time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub held_shares: Option<Vec<HeldShare>>,
@@ -432,7 +421,7 @@ impl SealedStore {
         Ok(())
     }
 
-    /// Phase 6a: Store custodian->share assignments and broker-held shares.
+    /// Store custodian-to-index assignments and broker-held shares.
     pub async fn update_share_assignments(
         &self,
         handle: &Uuid,
@@ -479,7 +468,7 @@ impl SealedStore {
         Ok(())
     }
 
-    /// Phase 6a: Mark a custodian's share as claimed and return it.
+    /// Mark a custodian's share as claimed and return it.
     pub async fn claim_custodian_share(
         &self,
         handle: &Uuid,
@@ -705,47 +694,6 @@ impl SealedStore {
         })
         .await?
     }
-
-    #[cfg(test)]
-    pub async fn corrupt_signature(&self, handle: &Uuid) -> Result<()> {
-        let tree = self.tree.clone();
-        let cipher = self.cipher.clone();
-        let key = handle.as_bytes().to_vec();
-
-        task::spawn_blocking(move || -> Result<()> {
-            let value = tree
-                .get(&key)?
-                .ok_or_else(|| anyhow!("sealed secret handle not found for corruption"))?;
-            let encrypted: EncryptedRecord =
-                serde_json::from_slice(&value).context("deserializing encrypted envelope")?;
-            let nonce = STANDARD
-                .decode(encrypted.nonce.as_bytes())
-                .context("decoding envelope nonce")?;
-            let ciphertext = STANDARD
-                .decode(encrypted.ciphertext.as_bytes())
-                .context("decoding envelope ciphertext")?;
-            let plaintext = decrypt_payload(&cipher, &nonce, &ciphertext)?;
-            let mut record: StoredEnvelopeRecord =
-                serde_json::from_slice(&plaintext).context("deserializing sealed envelope")?;
-            record.signature = STANDARD.encode(b"corrupted-signature");
-            let updated = serde_json::to_vec(&record).context("serializing corrupted record")?;
-            let (new_nonce, new_ciphertext) = encrypt_payload(&cipher, &updated)?;
-            let encrypted_record = EncryptedRecord {
-                nonce: STANDARD.encode(&new_nonce),
-                ciphertext: STANDARD.encode(&new_ciphertext),
-            };
-            tree.insert(
-                key,
-                serde_json::to_vec(&encrypted_record)
-                    .context("serializing corrupted encrypted record")?,
-            )?;
-            tree.flush()?;
-            Ok(())
-        })
-        .await??;
-
-        Ok(())
-    }
 }
 
 fn encrypt_payload(cipher: &Aes256Gcm, plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
@@ -842,7 +790,7 @@ mod tests {
                 algorithm: "kyber768-hybrid".into(),
                 ciphertext: B64.encode(b"cipher-bytes"),
                 kyber_ciphertext: B64.encode(b"kem-bytes"),
-                customer_id: "tor-auth".into(),
+                customer_id: "example-customer".into(),
                 exporter_binding: Some(B64.encode(b"exporter")),
                 metadata: Some(Value::String("metadata".into())),
                 created_at: Utc::now(),

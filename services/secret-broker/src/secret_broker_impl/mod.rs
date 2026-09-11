@@ -1,7 +1,4 @@
-//! Secret-broker implementation backing the standalone broker runtime.
-//!
-//! New code should prefer `crate::secret_broker_core`; this module is the
-//! implementation home behind those stable re-exports.
+//! Private implementation backing the standalone secret-broker runtime.
 
 pub mod crypto_engine;
 pub mod handlers;
@@ -30,17 +27,11 @@ use self::state::{BrokerState, BrokerStateConfig};
 use self::transparency::TransparencyLogger;
 type HmacSha256 = Hmac<Sha256>;
 
-/// Per-request caller lineage for secret-broker operations.
+/// Per-request caller lineage derived from the live mTLS/RA-TLS connection.
 ///
-/// The authoritative production path is the standalone broker, where this
-/// context is derived from the live mTLS/RA-TLS connection and carries the TLS
-/// exporter plus any authenticated peer identity material we can prove from the
-/// certificate presented on that channel.
-///
-/// Dev-only embedded flows do not have a real transport. They may still mint a
-/// synthetic exporter binding so redeem-token math remains deterministic, but
-/// that synthetic context is explicitly unauthenticated and must never be
-/// treated as equivalent to the standalone broker trust boundary.
+/// Production construction carries the TLS exporter and authenticated identity
+/// material proven by the certificate presented on that channel. Unit tests use
+/// a separate unauthenticated constructor to exercise rejection paths.
 #[derive(Clone, Debug)]
 pub struct BrokerClientContext {
     exporter: Vec<u8>,
@@ -52,19 +43,18 @@ pub struct BrokerClientContext {
 }
 
 impl BrokerClientContext {
+    #[cfg(test)]
     fn from_master_key(master_key: &[u8]) -> Result<Self> {
         let mut mac = HmacSha256::new_from_slice(master_key)
             .map_err(|_| anyhow::anyhow!("invalid master key length for HMAC"))?;
-        mac.update(b"secret-broker-embedded-broker-v1");
+        mac.update(b"secret-broker-test-context-v1");
         let exporter = mac.finalize().into_bytes().to_vec();
         Ok(Self::synthetic_dev_context(exporter))
     }
 
-    /// Dev/test-only synthetic broker context.
-    ///
-    /// This preserves deterministic handle binding when there is no live mTLS
-    /// channel. The resulting context is intentionally unauthenticated.
-    pub fn synthetic_dev_context(exporter: impl Into<Vec<u8>>) -> Self {
+    /// Test-only synthetic context for exercising cryptographic binding logic.
+    #[cfg(test)]
+    pub(crate) fn synthetic_dev_context(exporter: impl Into<Vec<u8>>) -> Self {
         Self {
             exporter: exporter.into(),
             session_id: None,
@@ -119,32 +109,22 @@ impl BrokerClientContext {
     }
 }
 
-/// Shared state wrapper used by the secret-broker core.
-pub struct EmbeddedBrokerState {
-    pub broker: BrokerState,
-    pub context: BrokerClientContext,
+/// Standalone broker state. Caller identity is supplied exclusively by the
+/// authenticated TLS connection attached to each request.
+pub(crate) struct SecretBrokerState {
+    pub(crate) broker: BrokerState,
 }
 
-impl EmbeddedBrokerState {
-    /// Initialize from environment.
-    ///
-    /// Requires `BROKER_MASTER_KEY_FILE` - path to a 32-byte master key file.
-    /// Optional: `BROKER_SLED_PATH` (default: /var/lib/secret-broker/broker.sled)
-    ///           `BROKER_TRANSPARENCY_LOG` (default: /var/log/secret-broker/broker-transparency.jsonl)
-    pub async fn from_env() -> Result<Self> {
-        let (broker, master_key_bytes) = load_broker_from_env().await?;
-        let context = BrokerClientContext::from_master_key(&master_key_bytes)?;
-        info!("secret broker synthetic context initialised");
-        Ok(Self { broker, context })
-    }
-}
-
-pub async fn broker_state_from_env() -> Result<BrokerState> {
-    let (broker, _master_key_bytes) = load_broker_from_env().await?;
+pub(crate) async fn broker_state_from_env(
+    require_attested_discharge_mint: bool,
+) -> Result<BrokerState> {
+    let (broker, _master_key_bytes) = load_broker_from_env(require_attested_discharge_mint).await?;
     Ok(broker)
 }
 
-async fn load_broker_from_env() -> Result<(BrokerState, Zeroizing<Vec<u8>>)> {
+async fn load_broker_from_env(
+    require_attested_discharge_mint: bool,
+) -> Result<(BrokerState, Zeroizing<Vec<u8>>)> {
     let master_key_path = std::env::var("BROKER_MASTER_KEY_FILE")
         .context("BROKER_MASTER_KEY_FILE env var required for secret broker")?;
 
@@ -248,7 +228,6 @@ async fn load_broker_from_env() -> Result<(BrokerState, Zeroizing<Vec<u8>>)> {
         },
     );
 
-    let require_attested_discharge_mint = discharge_attestation_required_from_env()?;
     let allowed_discharge_principals = env_csv("BROKER_DISCHARGE_PRINCIPAL_ALLOWLIST");
     broker.configure_discharge_policy(
         require_attested_discharge_mint,
@@ -288,7 +267,7 @@ fn env_flag_enabled(key: &str, default: bool) -> Result<bool> {
     }
 }
 
-fn discharge_attestation_required_from_env() -> Result<bool> {
+pub(crate) fn discharge_attestation_required_from_env() -> Result<bool> {
     env_flag_enabled("BROKER_REQUIRE_DISCHARGE_ATTESTATION", true)
 }
 

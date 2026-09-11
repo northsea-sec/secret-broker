@@ -13,13 +13,10 @@
 //!   peers that emit RA-TLS certs in this wire format.
 //!
 //! Scope:
-//! - Intel TDX and SGX quotes: verified end-to-end against a PCCS-served
-//!   collateral bundle via `dcap_qvl::verify::verify`.
-//! - AMD SEV-SNP: detected by quote-header heuristic and reported as
-//!   `TEEVendor::AmdSevSnp`. Upstream call-sites
-//!   (`service_auth::ratls::reject_unsupported_verified_ratls_vendor`) reject
-//!   AMD before `verify_with_ra_pubkey` is invoked, so the AMD verification
-//!   path is intentionally a hard error rather than a fail-closed stub.
+//! - Intel TDX and SGX quotes are verified end-to-end against PCCS collateral
+//!   via `dcap_qvl::verify::verify`.
+//! - Every unrecognized quote header is classified as unsupported. The parser
+//!   does not guess a TEE vendor from bytes it cannot fully verify.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -41,7 +38,7 @@ const RA_TLS_BINDING_TAG: &[u8] = b"ratls-cert";
 pub mod vendor {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum TEEVendor {
-        AmdSevSnp,
+        UnsupportedQuoteFormat,
         IntelTDX,
         IntelSGX,
     }
@@ -101,9 +98,8 @@ pub mod attestation {
         /// Classify the TEE vendor from the leading bytes of the quote.
         ///
         /// Intel SGX/TDX quotes start with a version u16 LE in
-        /// {3, 4, 5} and have a tee_type u32 LE at offset 4. Anything else
-        /// is reported as AMD SEV-SNP and rejected by the upstream policy
-        /// gate before `verify_with_ra_pubkey` is called.
+        /// {3, 4, 5} and have a tee_type u32 LE at offset 4. Every other
+        /// header is unsupported because this implementation cannot verify it.
         pub fn detect_vendor_from_quote(&self) -> Result<TEEVendor> {
             if self.quote.len() < 8 {
                 bail!(
@@ -117,29 +113,24 @@ pub mod attestation {
             const TEE_TYPE_SGX: u32 = 0x0000_0000;
             const TEE_TYPE_TDX: u32 = 0x0000_0081;
             match (version, tee_type) {
-                (3, _) => Ok(TEEVendor::IntelSGX),
+                (3, TEE_TYPE_SGX) => Ok(TEEVendor::IntelSGX),
                 (4 | 5, TEE_TYPE_TDX) => Ok(TEEVendor::IntelTDX),
                 (4 | 5, TEE_TYPE_SGX) => Ok(TEEVendor::IntelSGX),
-                _ => Ok(TEEVendor::AmdSevSnp),
+                _ => Ok(TEEVendor::UnsupportedQuoteFormat),
             }
         }
 
-        /// Verify the quote against Intel PCS collateral and check that the
-        /// quote's `report_data` field is bound to the peer certificate's
-        /// public key via the RA-TLS binding formula.
-        ///
-        /// AMD SEV-SNP quotes are rejected here; the upstream policy gate
-        /// must reject them before this method is reached.
+        /// Verify a supported Intel quote against PCS collateral and check that
+        /// its `report_data` is bound to the peer certificate public key.
         pub async fn verify_with_ra_pubkey(
             &self,
             pubkey_der: &[u8],
             pccs_url: &str,
         ) -> Result<VerifiedAttestation> {
             let vendor = self.detect_vendor_from_quote()?;
-            if matches!(vendor, TEEVendor::AmdSevSnp) {
+            if matches!(vendor, TEEVendor::UnsupportedQuoteFormat) {
                 bail!(
-                    "AMD SEV-SNP attestation verification is not implemented in this module; \
-                     call-site must reject AMD before invoking verify_with_ra_pubkey"
+                    "unsupported RA-TLS quote format; this build verifies Intel SGX and TDX DCAP evidence"
                 );
             }
 

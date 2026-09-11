@@ -138,9 +138,7 @@ impl QuantumResistantCrypto {
         );
 
         match request.algorithm {
-            super::service::EncryptionAlgorithm::Kyber512
-            | super::service::EncryptionAlgorithm::Kyber768
-            | super::service::EncryptionAlgorithm::Kyber1024 => {
+            super::service::EncryptionAlgorithm::Kyber768 => {
                 self.encrypt_with_mlkem(
                     &request.data,
                     &request.key_id,
@@ -167,9 +165,7 @@ impl QuantumResistantCrypto {
         );
 
         match request.algorithm {
-            super::service::EncryptionAlgorithm::Kyber512
-            | super::service::EncryptionAlgorithm::Kyber768
-            | super::service::EncryptionAlgorithm::Kyber1024 => {
+            super::service::EncryptionAlgorithm::Kyber768 => {
                 let mlkem_ciphertext = request.nonce.as_ref().ok_or_else(|| {
                     anyhow::anyhow!(
                         " CRITICAL: Missing ML-KEM ciphertext in nonce field for decryption"

@@ -16,7 +16,7 @@ pub use client::{
 /// Expected length of a threshold share y-coordinate (32 bytes / 256 bits).
 pub const SHARE_Y_LEN: usize = 32;
 
-pub mod broker_proto {
+mod broker_proto {
     tonic::include_proto!("secretbroker.v1");
 }
 
@@ -52,6 +52,25 @@ use broker_proto::{
     WrapSecretV2Request as GrpcWrapSecretV2Request,
 };
 
+/// Lifecycle policy for a brokered V2 capability.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SecretLifecycle {
+    #[default]
+    SingleUseUnwrap,
+    RenewableLease,
+    ServiceBootstrap,
+}
+
+impl SecretLifecycle {
+    fn into_proto(self) -> GrpcSecretLifecycle {
+        match self {
+            Self::SingleUseUnwrap => GrpcSecretLifecycle::SingleUseUnwrap,
+            Self::RenewableLease => GrpcSecretLifecycle::RenewableLease,
+            Self::ServiceBootstrap => GrpcSecretLifecycle::ServiceBootstrap,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WrapResponse {
     pub handle: String,
@@ -71,7 +90,7 @@ pub struct WrapV2Params {
     pub circuit_id: Option<String>,
     pub node_id: Option<String>,
     pub ttl_seconds: Option<u64>,
-    pub lifecycle: Option<GrpcSecretLifecycle>,
+    pub lifecycle: Option<SecretLifecycle>,
     pub initial_lease_seconds: Option<u64>,
     pub label: Option<String>,
     pub unwrap_principal_id: Option<String>,
@@ -123,11 +142,11 @@ pub struct MintAeadKeyV2Params {
     pub provider: Option<String>,
     pub threshold: Option<u8>,
     pub num_shares: Option<u8>,
-    pub lifecycle: Option<GrpcSecretLifecycle>,
+    pub lifecycle: Option<SecretLifecycle>,
     pub initial_lease_seconds: Option<u64>,
     pub unwrap_principal_id: Option<String>,
-    /// Phase 6a: Custodian identifiers for broker-held share distribution.
-    /// When set with threshold > 1, shares are NOT returned in the response.
+    /// Custodian identifiers for broker-held threshold-share distribution.
+    /// When set with threshold > 1, shares are not returned in the response.
     pub custodian_ids: Option<Vec<String>>,
 }
 
@@ -262,8 +281,6 @@ pub struct CryptoKeyPairResult {
     pub algorithm: String,
 }
 
-// -- Phase 4: Lifecycle types --------------------------------------------------
-
 #[derive(Debug, Clone)]
 pub struct RenewLeaseResult {
     pub lease_expires_at: Option<DateTime<Utc>>,
@@ -281,7 +298,7 @@ pub struct RotateParams {
     pub customer_id: Option<String>,
     pub metadata: Option<Value>,
     pub ttl_seconds: Option<u64>,
-    pub lifecycle: Option<i32>,
+    pub lifecycle: Option<SecretLifecycle>,
     pub rotation_reason: Option<String>,
     pub threshold: Option<u8>,
     pub num_shares: Option<u8>,
@@ -298,7 +315,7 @@ pub struct RotateResult {
     pub new_shares: Vec<ThresholdShareMaterial>,
 }
 
-/// Result of a custodian share claim (Phase 6a).
+/// Result of an authenticated custodian share claim.
 #[derive(Debug, Clone)]
 pub struct ClaimShareResult {
     pub share: ThresholdShareMaterial,
@@ -431,9 +448,7 @@ impl SecretBrokerGrpcAdapter {
     ) -> Result<WrapResponse> {
         self.purge_expired(Utc::now());
         let metadata_struct = option_json_to_struct(params.metadata)?;
-        let lifecycle = params
-            .lifecycle
-            .unwrap_or(GrpcSecretLifecycle::SingleUseUnwrap);
+        let lifecycle = params.lifecycle.unwrap_or_default().into_proto();
         let requested_principal = params
             .unwrap_principal_id
             .as_ref()
@@ -530,9 +545,7 @@ impl SecretBrokerGrpcAdapter {
         params: MintAeadKeyV2Params,
     ) -> Result<MintAeadKeyV2Lease> {
         let mut client = SecretBrokerServiceClient::new(self.channel.clone());
-        let lifecycle = params
-            .lifecycle
-            .unwrap_or(GrpcSecretLifecycle::SingleUseUnwrap);
+        let lifecycle = params.lifecycle.unwrap_or_default().into_proto();
         let requested_principal = params
             .unwrap_principal_id
             .as_ref()
@@ -960,7 +973,11 @@ impl SecretBrokerGrpcAdapter {
             customer_id: params.customer_id.unwrap_or_default(),
             metadata: metadata_struct,
             ttl_seconds: params.ttl_seconds.unwrap_or(0),
-            lifecycle: params.lifecycle.unwrap_or(0),
+            lifecycle: params
+                .lifecycle
+                .map(SecretLifecycle::into_proto)
+                .map(|lifecycle| lifecycle as i32)
+                .unwrap_or_default(),
             rotation_reason: params.rotation_reason.unwrap_or_default(),
             threshold: params.threshold.unwrap_or(0) as u32,
             num_shares: params.num_shares.unwrap_or(0) as u32,
@@ -997,7 +1014,7 @@ impl SecretBrokerGrpcAdapter {
         })
     }
 
-    /// Phase 6a: Claim an assigned threshold share as an authenticated custodian.
+    /// Claim an assigned threshold share as an authenticated custodian.
     pub async fn claim_share(&self, handle: &str, custodian_id: &str) -> Result<ClaimShareResult> {
         let mut client = SecretBrokerServiceClient::new(self.channel.clone());
         let request = GrpcClaimShareRequest {
@@ -1303,10 +1320,10 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_v2_unwrap_principal_allows_cross_principal_bootstrap_target() {
-        let adapter = test_adapter(Some("spiffe://secretbroker.local/core/proxy"));
+        let adapter = test_adapter(Some("spiffe://secretbroker.local/workload/client-a"));
         let channel = DescribeChannelResponse {
             authenticated_transport: true,
-            principal_id: "spiffe://secretbroker.local/core/proxy".into(),
+            principal_id: "spiffe://secretbroker.local/workload/client-a".into(),
             peer_cert_sha256: vec![0x01, 0x02, 0x03],
             ..Default::default()
         };
@@ -1314,20 +1331,17 @@ mod tests {
         let resolved = adapter
             .resolve_v2_unwrap_principal(
                 SecretLifecycle::ServiceBootstrap,
-                Some("spiffe://secretbroker.local/tenant-agent/tenant-a".into()),
+                Some("spiffe://secretbroker.local/workload/tenant-a".into()),
                 &channel,
             )
             .expect("cross-principal bootstrap target should be accepted");
 
-        assert_eq!(
-            resolved,
-            "spiffe://secretbroker.local/tenant-agent/tenant-a"
-        );
+        assert_eq!(resolved, "spiffe://secretbroker.local/workload/tenant-a");
     }
 
     #[tokio::test]
     async fn resolve_v2_unwrap_principal_rejects_client_broker_principal_mismatch() {
-        let adapter = test_adapter(Some("spiffe://secretbroker.local/core/proxy"));
+        let adapter = test_adapter(Some("spiffe://secretbroker.local/workload/client-a"));
         let channel = DescribeChannelResponse {
             authenticated_transport: true,
             principal_id: "spiffe://secretbroker.local/core/other".into(),
@@ -1341,7 +1355,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("broker channel principal mismatch: client=spiffe://secretbroker.local/core/proxy broker=spiffe://secretbroker.local/core/other")
+                .contains("broker channel principal mismatch: client=spiffe://secretbroker.local/workload/client-a broker=spiffe://secretbroker.local/core/other")
         );
     }
 
@@ -1350,7 +1364,7 @@ mod tests {
         let adapter = test_adapter(None);
         let channel = DescribeChannelResponse {
             authenticated_transport: false,
-            principal_id: "spiffe://secretbroker.local/core/proxy".into(),
+            principal_id: "spiffe://secretbroker.local/workload/client-a".into(),
             ..Default::default()
         };
 
@@ -1368,7 +1382,7 @@ mod tests {
         let adapter = test_adapter(None);
         let channel = DescribeChannelResponse {
             authenticated_transport: true,
-            principal_id: "spiffe://secretbroker.local/core/proxy".into(),
+            principal_id: "spiffe://secretbroker.local/workload/client-a".into(),
             ..Default::default()
         };
 
